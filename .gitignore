@@ -1,0 +1,36 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# 依赖与运行时
+node_modules/
+napcat/
+
+# 配置（含密钥）
+.env
+.env.*
+!.env.example
+
+# 运行数据（QQ 头像/图片/入典/白名单/人设等，含敏感信息）
+data/
+
+# 部署与调试脚本（含服务器凭据、探测用 API Key、临时产物）
+deploy/
+check_*.py
+check_*.sh
+probe_*.py
+probe_*.sh
+test_*.py
+smoke_*.py
+fetch_irena.py
+compress_irena.py
+fix_qa_images.py
+srv_debug_summary.py
+recreate_napcat*.sh
+deploy_sense.sh
+qrcode.png
+bp_*.html
+
+# 日志
+*.log
