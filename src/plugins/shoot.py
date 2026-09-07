@@ -1,9 +1,10 @@
-"""引用图片回复「射」→ 返回叠加白色黏液特效后的图片
+"""引用图片回复「射」→ 返回白色涂料喷溅动画 GIF
 
 用法：引用（回复）一张图片，然后发送单字「射」；
-机器人对该图片叠加白色黏液飞溅/流挂特效后返回处理结果。
-效果逻辑移植自 white_slime.py（Pillow），覆盖量固定 1.5，种子随机，每次效果不同。
+机器人对该图片生成「白色黏稠涂料喷溅」的循环动画 GIF 后返回。
+效果逻辑移植自 white_paint.py（Pillow + numpy），模拟涂料附着在图片前的透明平面上。
 """
+import asyncio
 import io
 import logging
 import math
@@ -13,6 +14,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import numpy as np
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import (
     Bot,
@@ -20,7 +22,7 @@ from nonebot.adapters.onebot.v11 import (
     MessageEvent,
     MessageSegment,
 )
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 from .common import QA_IMG_DIR
 
@@ -30,8 +32,9 @@ logger = logging.getLogger("sorting_hat.shoot")
 QA_IMG_DIR.mkdir(parents=True, exist_ok=True)
 IMG_DIR_CONTAINER = "/app/napcat/qa_images"
 
-_AMOUNT = 1.5                      # 黏液覆盖量（参考 white_slime.py 默认值）
-_MAX_EDGE = 2048                   # 处理前最长边上限，超大图先等比缩小，避免占满内存
+_PAINT_WIDTH = 480      # 最大宽度（参考 white_paint.py 默认）
+_PAINT_FPS = 20         # 每秒帧数
+_PAINT_SECONDS = 5      # 动画时长（秒），末帧停留 1s
 
 
 def _lan() -> object:
@@ -42,91 +45,96 @@ def _lan() -> object:
         return Image.LANCZOS
 
 
-def _shift(mask: Image.Image, dx: int, dy: int) -> Image.Image:
-    """平移并以零填充边缘，不让阴影绕回画布另一侧。"""
-    result = Image.new("L", mask.size)
-    result.paste(mask, (dx, dy))
-    return result
+def _paint_gif(content: bytes, seed: int) -> bytes | None:
+    """把图片字节处理为白色涂料喷溅循环 GIF 字节；失败返回 None。
 
-
-def add_slime(image: Image.Image, amount: float = _AMOUNT, seed: int | None = None) -> Image.Image:
-    """给图片叠加白色黏液飞溅、流挂和高光，返回 RGBA 图片；不修改输入图片。"""
-    if not math.isfinite(amount) or not 0.1 <= amount <= 5:
-        raise ValueError("覆盖量必须在 0.1～5 之间")
-    rng = random.Random(seed)
-    base = ImageOps.exif_transpose(image).convert("RGBA")
-    w, h = base.size
-    # 在统一尺度生成抗锯齿液体遮罩，再适配原图大小
-    scale = 1400 / max(w, h)
-    sw, sh = max(1, round(w * scale)), max(1, round(h * scale))
-    unit = min(sw, sh)
-    mask = Image.new("L", (sw, sh))
-    draw = ImageDraw.Draw(mask)
-
-    def drop(x, y, radius, stretch=1):
-        draw.ellipse((x - radius, y - radius * stretch, x + radius, y + radius * stretch), fill=255)
-
-    for _ in range(round(32 * amount)):
-        x, y = rng.uniform(0, sw), rng.uniform(0, sh)
-        radius = rng.uniform(.016, .053) * unit
-        drop(x, y, radius, rng.uniform(.7, 1.3))
-        # 由粗到细的放射液柱，末端点缀分离液滴
-        for _ in range(rng.randint(5, 11)):
-            angle = rng.uniform(0, math.tau)
-            length = radius * rng.uniform(1.4, 4.3)
-            dx, dy = math.cos(angle), math.sin(angle)
-            bend = rng.uniform(-.35, .35) * radius
-            for step in range(22):
-                t = step / 21
-                px = x + dx * length * t - dy * bend * math.sin(t * math.pi)
-                py = y + dy * length * t + dx * bend * math.sin(t * math.pi)
-                drop(px, py, max(.8, radius * .31 * (1 - t) + radius * .04))
-            if rng.random() < .8:
-                drop(x + dx * length * 1.18, y + dy * length * 1.18, radius * rng.uniform(.08, .19))
-        # 重力下垂的流挂与圆润滴头
-        if rng.random() < .8:
-            length = rng.uniform(1.4, 5) * radius
-            drift = rng.uniform(-.6, .6) * radius
-            for step in range(35):
-                t = step / 34
-                drop(x + drift * t, y + length * t, radius * (.24 - .13 * t))
-            drop(x + drift, y + length, radius * .22, 1.35)
-    for _ in range(round(260 * amount)):
-        drop(rng.uniform(0, sw), rng.uniform(0, sh), rng.uniform(.0015, .006) * unit)
-    mask = mask.filter(ImageFilter.GaussianBlur(max(.5, unit * .0012)))
-    mask = mask.resize((w, h), _lan())
-    bevel = max(1, round(min(w, h) * .003))
-    shadow = _shift(mask, bevel, bevel * 2).filter(ImageFilter.GaussianBlur(bevel * 1.6))
-    shadow = shadow.point(lambda p: round(p * .28))
-    result = Image.alpha_composite(base, Image.new("RGBA", base.size, (0, 0, 0, 0)))
-    for color, alpha in [((30, 32, 35), shadow), ((239, 239, 233), mask)]:
-        layer = Image.new("RGBA", base.size, (*color, 0))
-        layer.putalpha(alpha)
-        result = Image.alpha_composite(result, layer)
-    highlight = ImageChops.subtract(mask, _shift(mask, bevel, bevel))
-    highlight = highlight.filter(ImageFilter.GaussianBlur(max(.5, bevel * .35)))
-    layer = Image.new("RGBA", base.size, (255, 255, 255, 0))
-    layer.putalpha(highlight)
-    return Image.alpha_composite(result, layer)
-
-
-def _process(content: bytes) -> bytes | None:
-    """把图片字节处理为叠加特效后的 JPEG 字节；失败返回 None。"""
-    with Image.open(io.BytesIO(content)) as im:
-        im = ImageOps.exif_transpose(im).convert("RGBA")
-        longest = max(im.size)
-        if longest > _MAX_EDGE:
-            ratio = _MAX_EDGE / longest
-            im = im.resize(
-                (max(1, round(im.width * ratio)), max(1, round(im.height * ratio))),
-                _lan(),
-            )
-        res = add_slime(im, amount=_AMOUNT, seed=None)
-    # 白色底合成为 JPEG，体积小、群内发送快
-    bg = Image.new("RGB", res.size, "white")
-    bg.paste(res, mask=res.getchannel("A"))
+    逐帧模拟：主喷流飞入 → 撞击后高斯厚度场扩散沉积成黏稠覆盖层 → 顺重力下流，
+    液滴自然融合，配合灰度高度场法线打光与高光。逻辑与 white_paint.py 一致。
+    """
+    im = ImageOps.exif_transpose(Image.open(io.BytesIO(content))).convert("RGB")
+    im.thumbnail((_PAINT_WIDTH, round(_PAINT_WIDTH * 1.5)), _lan())
+    w, h = im.size
+    rng = np.random.default_rng(seed)
+    base = np.asarray(im, dtype=np.float32)
+    yy, xx = np.mgrid[:h, :w].astype(np.float32)
+    scale = w / _PAINT_WIDTH
+    drops = []
+    # 主喷流分成多束，形成不同大小的沉积与细碎卫星液滴
+    for i in range(155):
+        start = float(rng.uniform(.3, 2.15))
+        tx = float(np.clip(rng.normal(.53, .20), .09, .93) * w)
+        ty = float(np.clip(rng.normal(.52, .23), .10, .94) * h)
+        radius = float(rng.uniform(5, 19) if i < 90 else rng.uniform(1.5, 5)) * scale
+        drops.append((start, float(rng.uniform(.25, .48)), tx, ty, radius,
+                      float(rng.uniform(.65, 1.2)), float(rng.uniform(5, 28)) * scale))
+    frames = []
+    for frame in range(round(_PAINT_FPS * _PAINT_SECONDS)):
+        t = frame / _PAINT_FPS
+        depth = np.zeros((h, w), dtype=np.float32)
+        airborne = Image.new("RGBA", (w, h))
+        pen = ImageDraw.Draw(airborne)
+        for start, flight, tx, ty, r, strength, drip in drops:
+            age = t - start
+            if age < 0:
+                continue
+            if age < flight:
+                p = age / flight
+                sx, sy = -.12 * w, -.08 * h
+                x = sx + (tx - sx) * p
+                y = sy + (ty - sy) * p - .12 * h * math.sin(math.pi * p)
+                vx, vy = tx - sx, ty - sy - .12 * h * math.pi * math.cos(math.pi * p)
+                norm = math.hypot(vx, vy)
+                length = (12 + r * 1.2) * (1 - .45 * p)
+                tail = (x - vx / norm * length, y - vy / norm * length)
+                rr = max(1, r * (.16 + .22 * p))
+                pen.line([tail, (x, y)], fill=(221, 222, 215, 220), width=max(2, int(rr * 2)))
+                pen.ellipse((x - rr, y - rr, x + rr, y + rr), fill=(252, 252, 246, 250))
+                pen.line([(tail[0] - 1, tail[1] - 1), (x - 1, y - 1)],
+                         fill=(255, 255, 251, 190), width=max(1, int(rr * .5)))
+                continue
+            elapsed = age - flight
+            spread = .62 + .38 * (1 - math.exp(-elapsed * 15))
+            rad = r * spread
+            run = drip * max(0, elapsed - .3) ** .68
+            # 有限范围高斯厚度场，液滴自然融合成不规则黏稠覆盖层
+            xmin, xmax = max(0, int(tx - r * 3)), min(w, int(tx + r * 3 + 1))
+            ymin, ymax = max(0, int(ty - r * 3)), min(h, int(ty + run + r * 3 + 1))
+            X, Y = xx[ymin:ymax, xmin:xmax], yy[ymin:ymax, xmin:xmax]
+            patch = strength * np.exp(-((X - tx) / (rad * 1.12)) ** 2 - ((Y - ty) / rad) ** 2)
+            if r > 7 * scale and run > 0:
+                center = np.clip(Y, ty, ty + run)
+                patch += .63 * strength * np.exp(-((X - tx) / (rad * .3)) ** 2 - ((Y - center) / (rad * .45)) ** 2)
+                patch += .5 * strength * np.exp(-((X - tx) / (rad * .42)) ** 2 - ((Y - ty - run) / (rad * .55)) ** 2)
+            depth[ymin:ymax, xmin:xmax] += patch
+        alpha = np.clip((depth - .13) * 7, 0, 1)
+        smooth = np.minimum(depth, 1.8)
+        gy, gx = np.gradient(smooth)
+        nx, ny = -gx * 10, -gy * 10
+        inv = 1 / np.sqrt(nx * nx + ny * ny + 1)
+        light = np.clip((-.4 * nx - .55 * ny + .73) * inv, 0, 1)
+        shine = np.clip((-.22 * nx - .3 * ny + .928) * inv, 0, 1) ** 35
+        tone = np.clip(190 + 55 * light + 30 * shine, 0, 255)
+        paint = np.stack([tone, tone, tone * .982], axis=-1)
+        mask = Image.fromarray(np.uint8(alpha * 255))
+        shadow = np.asarray(mask.filter(ImageFilter.GaussianBlur(2.2 * scale)), dtype=np.float32) / 255
+        shadow = np.roll(shadow, (max(1, int(3 * scale)), max(1, int(2 * scale))), axis=(0, 1))
+        composite = base * (1 - .28 * shadow[..., None])
+        composite = composite * (1 - alpha[..., None]) + paint * alpha[..., None]
+        image = Image.fromarray(np.uint8(np.clip(composite, 0, 255))).convert("RGBA")
+        image = Image.alpha_composite(image, airborne).convert("RGB")
+        frames.append(image.quantize(colors=128, method=Image.Quantize.MEDIANCUT))
     buf = io.BytesIO()
-    bg.save(buf, format="JPEG", quality=92)
+    n = len(frames)
+    frames[0].save(
+        buf,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=[round(1000 / _PAINT_FPS)] * (n - 1) + [1000],
+        loop=0,
+        optimize=False,
+        disposal=2,
+    )
     return buf.getvalue()
 
 
@@ -223,20 +231,21 @@ async def shoot_handler(bot: Bot, event: MessageEvent):
     content = await _fetch_image(refs[0])
     if not content:
         await shoot_matcher.finish("这张图我没能读出来，换一张试试？")
+    # GIF 逐帧合成是 CPU 密集操作，放到线程池执行，避免卡住消息处理
     try:
-        out = _process(content)
+        out = await asyncio.to_thread(_paint_gif, content, random.randint(0, 2**31 - 1))
     except Exception:
-        logger.exception("白色黏液特效处理失败")
+        logger.exception("白色涂料喷溅 GIF 生成失败")
         out = None
     if out is None:
         await shoot_matcher.finish("这张图处理失败了，换一张试试？")
-    fname = f"shoot_{time.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}.jpg"
+    fname = f"shoot_{time.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}.gif"
     try:
         (QA_IMG_DIR / fname).write_bytes(out)
     except OSError:
-        await shoot_matcher.finish("图片写盘失败了，稍后再试试？")
+        await shoot_matcher.finish("动图写盘失败了，稍后再试试？")
     await shoot_matcher.finish(MessageSegment.image(file=f"{IMG_DIR_CONTAINER}/{fname}"))
 
 
 # 启动自检日志：确认本文件最新代码已被加载
-logger.info("shoot 已加载 v1：引用图片回复「射」→ 白色黏液特效")
+logger.info("shoot 已加载 v2：引用图片回复「射」→ 白色涂料喷溅 GIF")
