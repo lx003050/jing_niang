@@ -29,7 +29,7 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.params import CommandArg
 
 from .admin_tools import OP_SEED, is_op
-from .common import DATA_DIR, QA_IMG_DIR, register_help
+from .common import DATA_DIR, QA_IMG_DIR, ai_config, register_help
 
 logger = logging.getLogger("sorting_hat.recall")
 
@@ -40,7 +40,7 @@ MAX_MSGS = 200                                 # 每群内存最多保留消息�
 MAX_RECALLS = 500                              # 每群最多保留撤回条数
 TRIM_BYTES = 20 * 1024 * 1024                  # 消息记录文件超过该大小后裁剪（保留 24h）
 CTX_COUNT = 5                                  # -a 附带的前后消息条数
-ROOT_ONLY_GROUPS = {603421145}                 # 这些群 /查看撤回 仅根管理员可用，其它群为管理员可用
+ROOT_ONLY_GROUPS = set(ai_config.root_only_groups)  # 这些群 /查看撤回 仅根管理员可用（.env: ROOT_ONLY_GROUPS）
 
 _msgs: dict[int, list[dict]] = {}       # group_id -> [{"id","u","x","imgs","t"}]
 _recalls: dict[int, list[dict]] = {}    # group_id -> [{"mid","u","name","x","imgs","t","rt"}]

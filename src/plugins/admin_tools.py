@@ -67,7 +67,7 @@ QA_FILE = DATA_DIR / "qa_pairs.json"
 
 QA_IMG_MOUNT = "/app/napcat/qa_images"  # NapCat 容器内挂载路径（对应宿主机 QA_IMG_DIR）
 
-OP_SEED = 392311062  # 初始管理员
+OP_SEED = ai_config.root_seed  # 根管理员 QQ（.env: ROOT_SEED；0=未配置，此时仅 /op 名单生效）
 
 
 # ---------- 基础存取 ----------

@@ -6,7 +6,7 @@
 - /镜像 example.com -3d        根管理员可指定时长（默认 1 天，最长 365 天）
 - /镜像代理 <网址>             经 SOCKS5 节点镜像（用于被墙站点，如 YouTube）
 
-建立后返回访问地址 http://8.130.54.147/<域名>/，过期自动删除。
+建立后返回访问地址（公网入口 MIRROR_BASE 在 .env 配置）/<域名>/，过期自动删除。
 """
 import asyncio
 import logging
@@ -17,12 +17,12 @@ from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent
 from nonebot.params import CommandArg
 
 from .admin_tools import OP_SEED
-from .common import register_help
+from .common import ai_config, register_help
 
 logger = logging.getLogger("sorting_hat.mirror")
 
 MIRROR_SCRIPT = "/srv/add_mirror.sh"
-MIRROR_BASE = "http://8.130.54.147"
+MIRROR_BASE = ai_config.mirror_base  # 镜像服务公网入口（.env: MIRROR_BASE）
 SOCKS_MIRROR_SCRIPT = "/srv/add_socks_mirror.sh"
 MAX_HOURS = 365 * 24  # 根管理员最长可指定时长
 

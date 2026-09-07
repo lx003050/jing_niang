@@ -91,6 +91,11 @@ class AIConfig(BaseModel):
     grok_api_key: str = ""                                # grok 所在平台 Key（moyuu）
     grok_base_url: str = "https://moyuu.cc/v1"
     grok_model: str = "grok-4.6"                          # grok 对话模型名
+    # /// 隐私脱敏配置：原硬编码的 QQ 号/群号/服务器地址迁到 .env，代码中不留真实值 ///
+    root_seed: int = 0           # 根管理员 QQ（ROOT_SEED）
+    restrict_group: int = 0      # 旧白名单管控群（RESTRICT_GROUP，0=未配置则不启用旧群自动建档）
+    root_only_groups: list[int] = []  # /查看撤回 仅根管理员可用群（ROOT_ONLY_GROUPS，JSON 数组）
+    mirror_base: str = ""        # 镜像服务公网入口（MIRROR_BASE，如 http://example.com）
 
 
 ai_config = get_plugin_config(AIConfig)
@@ -162,8 +167,9 @@ WL_CHAT = "chat"  # 特殊白名单项：AI 对话（@机器人 / 回复机器�
 # 管控群内始终放行的管理指令，避免白名单把权限管理本身锁死
 WL_MANAGE_CMDS = {"白名单", "op", "deop", "suop", "ophelp", "停生图", "打断生图", "取消生图"}
 
-# 旧硬编码管控群：首次接入白名单时自动沿用原放行命令集，保持既有行为不变
-RESTRICT_GROUP = 1037308494
+# 旧硬编码管控群：首次接入白名单时自动沿用原放行命令集，保持既有行为不变。
+# 真实群号在 .env 的 RESTRICT_GROUP 配置；0 = 未配置（默认不启用旧群自动建档）。
+RESTRICT_GROUP = ai_config.restrict_group
 RESTRICT_ALLOW_CMDS = {
     "生图", "文生图", "图生图", "生成图片", "伊蕾娜", "邦多利",
     "help", "帮助", "禁言", "mute", "解除禁言", "解禁", "unmute",
