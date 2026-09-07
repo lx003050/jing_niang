@@ -49,6 +49,7 @@ from .common import (
     QA_IMG_DIR,
     WL_CHAT,
     WL_MANAGE_CMDS,
+    ai_config,
     hide_help,
     register_help,
     send_forward_text,
