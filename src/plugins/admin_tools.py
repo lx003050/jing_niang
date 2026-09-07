@@ -49,6 +49,7 @@ from .common import (
     QA_IMG_DIR,
     WL_CHAT,
     WL_MANAGE_CMDS,
+    WL_WORD_FEATURES,
     ai_config,
     hide_help,
     register_help,
@@ -703,6 +704,8 @@ def _wl_canonical(tok: str) -> str | None:
     """把用户输入的功能名归一为主命令名或 WL_CHAT；未知功能返回 None。"""
     if tok in _CHAT_SYN:
         return WL_CHAT
+    if tok in WL_WORD_FEATURES:  # 词触发功能（如「射」）以触发词本体归一
+        return WL_WORD_FEATURES[tok]
     for forms in _collect_command_forms():
         names = [f[1:] for f in forms]
         if tok not in names:
@@ -720,6 +723,8 @@ def _wl_forms_of(name: str) -> set[str]:
     """
     if name == WL_CHAT:
         return {WL_CHAT}
+    if name in set(WL_WORD_FEATURES.values()):  # 词触发功能返回其全部触发词形式
+        return {k for k, v in WL_WORD_FEATURES.items() if v == name}
     out: set[str] = set()
     for forms in _collect_command_forms():
         mains = [f[1:] for f in forms if f in HELP_DESC]

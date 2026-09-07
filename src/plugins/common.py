@@ -167,6 +167,10 @@ WL_CHAT = "chat"  # 特殊白名单项：AI 对话（@机器人 / 回复机器�
 # 管控群内始终放行的管理指令，避免白名单把权限管理本身锁死
 WL_MANAGE_CMDS = {"白名单", "op", "deop", "suop", "ophelp", "停生图", "打断生图", "取消生图"}
 
+# 纯词触发功能（非 / 命令，以触发词本体进白名单管控）：
+# 键=用户实际发送的触发词，值=展示/规范名。如：引用图片回复「射」触发黏液特效。
+WL_WORD_FEATURES: dict[str, str] = {"射": "射"}
+
 # 旧硬编码管控群：首次接入白名单时自动沿用原放行命令集，保持既有行为不变。
 # 真实群号在 .env 的 RESTRICT_GROUP 配置；0 = 未配置（默认不启用旧群自动建档）。
 RESTRICT_GROUP = ai_config.restrict_group
@@ -265,6 +269,8 @@ def _restrict_msg_rule(event: GroupMessageEvent) -> bool:
     feats = wl_features(gid) or set()
     if cmd is not None:
         return cmd not in feats and cmd not in WL_MANAGE_CMDS
+    if text in feats:
+        return False  # 词触发功能（如引用图片回复「射」）已启用则放行
     if event.to_me:
         return WL_CHAT not in feats
     return True  # 管控群普通闲聊（非命令、非 @）一律拦截
