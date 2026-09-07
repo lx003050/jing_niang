@@ -256,16 +256,23 @@ async def _images_call_with_retry(
     raise last
 
 
-async def ai_text2image_file(prompt: str) -> Path | None:
-    """供 AI 对话通路等外部调用的云端文生图：按默认机型生成并存入本地，返回文件路径。"""
+async def ai_image_file(prompt: str, ref: Path | None = None) -> Path | None:
+    """供 AI 对话通路等外部调用的云端生图（默认机型）：
+    ref 提供本地图片路径时按图生图（以该图为底图重绘），否则按文生图；
+    自动追加与 /生图 一致的默认优化提示词。返回本地文件路径，失败返回 None。
+    """
     if not ai_config.moyuu_api_key:
         return None
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return None
+    prompt += DEFAULT_I2I_PROMPT if ref is not None else DEFAULT_T2I_PROMPT
     client = AsyncOpenAI(
         api_key=ai_config.moyuu_api_key, base_url=ai_config.moyuu_base_url, timeout=180.0
     )
     try:
         resp = await _images_call_with_retry(
-            client, edit=None, prompt=prompt, model=ai_config.image_model, size=ai_config.image_size
+            client, edit=ref, prompt=prompt, model=ai_config.image_model, size=ai_config.image_size
         )
     except Exception as e:
         logger.warning("AI 通路生图失败: %s", str(e)[:150])

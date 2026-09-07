@@ -701,6 +701,15 @@ _AI_TOOLS = [
                 "properties": {
                     "feature": {"type": "string", "description": "要代发的功能：help / 生图 / 伊蕾娜 / 邦多利"},
                     "args": {"type": "string", "description": "传给该功能的参数。生图时为用户想画的画面描述；其余可为空"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["img2img", "t2i"],
+                        "description": (
+                            "仅在 feature=生图 时选择生成方式："
+                            "用户引用/发送了图片并要求以它为底图修改、重绘、换风格 → img2img（会以该图为底图生成）；"
+                            "若引用的图片只是聊天上下文/风格举例，用户是想要按文字描述新画一张 → t2i。省略默认 t2i。"
+                        ),
+                    },
                 },
                 "required": ["feature"],
             },
@@ -741,7 +750,9 @@ def _feature_allowed(group_id: int, main: str) -> bool:
     return bool(feats & _FEATURE_CMDS[main])
 
 
-async def _ai_invoke_feature(bot: Bot, event: MessageEvent, main: str, args: str) -> str:
+async def _ai_invoke_feature(
+    bot: Bot, event: MessageEvent, main: str, args: str, mode: str = ""
+) -> str:
     """执行 AI 代发的功能（受当前群白名单约束），返回给 AI 的结果说明。"""
     group_id = getattr(event, "group_id", 0)
     if not _feature_allowed(group_id, main):
@@ -756,11 +767,18 @@ async def _ai_invoke_feature(bot: Bot, event: MessageEvent, main: str, args: str
                 await bot.send(event, text)
             return "功能清单已经发过去啦，让 TA 在里面挑想要的吧～"
         if main == "生图":
-            from .image_gen import DEFAULT_T2I_PROMPT, ai_text2image_file
+            from .image_gen import _reply_ref_images, _save_ref_image, ai_image_file
             prompt = (args or "").strip()
             if not prompt:
                 return "代发生图需要先知道要画什么，请让用户补一句画面描述。"
-            path = await ai_text2image_file(prompt + DEFAULT_T2I_PROMPT)
+            ref: Path | None = None
+            if (mode or "").strip().lower() == "img2img":
+                refs = await _reply_ref_images(bot, event)
+                if refs:
+                    ref = await _save_ref_image(refs[0])
+                if ref is None:
+                    return "你想基于某张图片做图生图，但我没有拿到被引用的图片，请让用户引用/发一张图后再试一次。"
+            path = await ai_image_file(prompt, ref)
             if path is None:
                 return "生图请求失败了（上游繁忙或 Key 未配置），没能出图。"
             await bot.send(event, MessageSegment.image(file=f"{QA_IMG_CONTAINER}/{path.name}"))
@@ -960,9 +978,10 @@ async def ai_handler(bot: Bot, event: MessageEvent):
                 if feature is None:
                     continue
                 note = await _ai_invoke_feature(
-                    bot, event, feature, str(args.get("args") or "")
+                    bot, event, feature, str(args.get("args") or ""),
+                    str(args.get("mode") or ""),
                 )
-                logger.info("AI 代发功能: feature=%s note=%s", feature, note)
+                logger.info("AI 代发功能: feature=%s mode=%s note=%s", feature, args.get("mode"), note)
                 reply = (reply + "\n" if reply else "") + note
 
     if not reply:
