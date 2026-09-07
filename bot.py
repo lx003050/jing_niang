@@ -1,4 +1,4 @@
-"""sorting_hat 分院帽 QQ 机器人启动入口
+"""鲸娘（sorting_hat）QQ 机器人启动入口
 
 运行方式: python bot.py
 """

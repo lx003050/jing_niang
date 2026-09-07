@@ -3,7 +3,7 @@
 - /切换人格 猫娘        -> 按模板把人设要求优化为 system prompt 后切换
 - /切换人格 -o 要求     -> 要求不经过优化，原样作为 system prompt
 - /切换人格 -cat        -> 切换为内置鲸娘人格
-- /切换人格 -b          -> 删除本群/本私聊人格，恢复默认分院帽人格
+- /切换人格 -b          -> 删除本群/本私聊人格，恢复默认鲸娘人格
 - /切换人格 小猫 -grok   -> 人格用现有 AI（DeepSeek）优化生成，对话模型切换为 grok
                             （-g / -grok 独立标记；单独 /切换人格 -grok 仅切模型不换人格）
 
@@ -318,7 +318,7 @@ async def view_cmd_handler(bot: Bot, event: MessageEvent):
                 prompt_text = sp
                 source = "管理员自定义 system_prompt.md"
             else:
-                prompt_text = "（未设置自定义人格，走内置默认分院帽人格，此处不展开）"
+                prompt_text = "（未设置自定义人格，走内置默认鲸娘人格，此处不展开）"
                 source = "内置默认"
     except FileNotFoundError:
         sp_text = ""
@@ -330,14 +330,14 @@ async def view_cmd_handler(bot: Bot, event: MessageEvent):
             prompt_text = sp_text
             source = "管理员自定义 system_prompt.md"
         else:
-            prompt_text = "（未设置自定义人格，走内置默认分院帽人格，此处不展开）"
+            prompt_text = "（未设置自定义人格，走内置默认鲸娘人格，此处不展开）"
             source = "内置默认"
     except Exception:
         await view_cmd.finish("读取人格失败，稍后再试试。")
 
     full = f"【{label} 当前生效的 system prompt】\n来源：{source}\n对话模型：{model_desc}\n\n{prompt_text}"
     try:
-        await send_forward_text(bot, event, full, name="分院帽·人格")
+        await send_forward_text(bot, event, full, name="鲸娘·人格")
     except Exception:
         await view_cmd.finish("合并转发发送失败，稍后再试试？")
 
@@ -569,7 +569,7 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
         _clear_model_override(scope)
         await _rename_self(bot, event, "")  # 清空群名片，恢复默认昵称
         src = "（管理员自定义版）" if (DATA_DIR / "system_prompt.md").exists() else "（内置默认版）"
-        await persona_cmd.finish(f"已恢复 {label} 的分院帽人格 🎩{src}，对话模型也回到默认，不影响其他群", at_sender=True)
+        await persona_cmd.finish(f"已恢复 {label} 的鲸娘人格 🐋{src}，对话模型也回到默认，不影响其他群", at_sender=True)
 
     # 仅模型参数：保留当前人格，只切 API 与模型
     if not clean:
@@ -615,7 +615,7 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
             "-add 在现有 system prompt 末尾追加词条（如：/切换人格 少说一点奥 -add）\n"
             "-grok/-g 对话模型换 grok\n-deepseek/-ds 对话模型换回 DeepSeek\n"
             "只给模型参数不给人设时，保留现有人格仅切模型\n"
-            "-b 恢复默认分院帽人格与模型",
+            "-b 恢复默认鲸娘人格与模型",
             at_sender=True,
         )
     if not ai_config.openai_api_key:

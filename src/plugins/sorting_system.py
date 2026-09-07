@@ -188,7 +188,7 @@ async def _today_sort_flow(matcher, bot: Bot, event: MessageEvent) -> None:
         # 阿兹卡班服刑中
         if u.get("release_ts", 0) > now:
             left = max(1, int((u["release_ts"] - now) / 86400) + 1)
-            early = (f"你还在阿兹卡班服刑中，剩余 {left} 天。刑满之前，帽子可不敢给你分院。", "阿兹卡班")
+            early = (f"你还在阿兹卡班服刑中，剩余 {left} 天。刑满之前，鲸娘可不敢给你分院。", "阿兹卡班")
         else:
             if u.get("release_ts", 0):
                 u["release_ts"], u["sentence"] = 0, 0  # 刑满自动释放
@@ -254,13 +254,13 @@ async def today_sort_handler(bot: Bot, event: MessageEvent):
 
 # ---------- 模糊触发：@机器人 的消息里提到「分院」即触发 ----------
 def _fuzzy_sort_rule(event: MessageEvent) -> bool:
-    # 仅当 @机器人（分院帽）时才做模糊识别；文本里单纯出现「分院帽」名字不算
+    # 仅当 @机器人（鲸娘）时才做模糊识别；文本里单纯出现「分院帽/鲸娘」名字不算
     if not isinstance(event, GroupMessageEvent) or not event.to_me:
         return False
     text = event.get_plaintext().strip()
     if text.startswith("/"):
         return False
-    return "分院" in text.replace("分院帽", "")
+    return "分院" in text.replace("分院帽", "").replace("鲸娘", "")
 
 
 fuzzy_sort_matcher = on_message(rule=_fuzzy_sort_rule, priority=0, block=True)

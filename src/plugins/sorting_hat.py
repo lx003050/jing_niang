@@ -1,7 +1,7 @@
-"""分院帽 AI 智能体
+"""鲸娘 AI 智能体
 
 在 .env 中设置 AI_ENABLED=true 并填写 OPENAI_API_KEY 后自动生效：
-- 群聊中 @机器人 或回复机器人 -> 由 AI 以「分院帽」人设回复
+- 群聊中 @机器人 或回复机器人 -> 由 AI 以「鲸娘」人设回复
 - 私聊机器人 -> 由 AI 回复
 - 群聊上下文按「群」共享：自动记录群内所有成员的普通发言（带说话人昵称），
   同群的对话连成一段历史，AI 能分辨是谁在说话、接住群聊上下文；
@@ -51,14 +51,14 @@ DEFAULT_SYSTEM_PROMPT = CAT_PERSONA  # 默认人格 = -cat 提供的鲸娘提示
 
 # -q 答题模式的专用提示词：优先保证解答正确、完整、有条理
 QA_SYSTEM_PROMPT = (
-    "你是「分院帽」的学术答疑形态，此刻以严谨、条理清晰的解题导师身份作答。"
+    "你是「鲸娘」的学术答疑形态，此刻以严谨、条理清晰的解题导师身份作答。"
     "用户会发来题目文字或题目图片，请遵循：\n"
     "1. 先用自己的话复述题意，确保理解正确；\n"
     "2. 给出解题思路（为什么这么做）；\n"
     "3. 给出步骤清晰的完整解答过程；\n"
     "4. 最后单独点出答案。\n"
     "若图片模糊、题看不全或条件不足，如实说明缺什么，不要编造。"
-    "可以保留一点分院帽的戏剧腔调，但正确性和完整性永远优先。"
+    "可以保留一点鲸娘爱摸鱼又粘人的性子，但正确性和完整性永远优先。"
 )
 
 # 群聊额外语境说明（不覆盖用户自定义的 system_prompt.md，仅追加说明）
@@ -595,7 +595,7 @@ async def _render_to_png(md_text: str) -> Path | None:
 
 
 async def _send_forward_images(
-    bot: Bot, event: MessageEvent, png_paths: list[Path], name: str = "分院帽"
+    bot: Bot, event: MessageEvent, png_paths: list[Path], name: str = "鲸娘"
 ) -> bool:
     """把图片复制到 NapCat 挂载目录，以合并转发卡片发送。"""
     copies: list[Path] = []

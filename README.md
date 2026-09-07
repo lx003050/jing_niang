@@ -1,17 +1,17 @@
-# Sorting Hat 分院帽 QQ 机器人
+# 鲸娘 QQ 机器人（NoneBot2）
 
-一个运行在本机的 QQ 机器人，身份是《哈利·波特》里的**分院帽**。基于 **NoneBot2 + NapCat (OneBot 11)**，支持接入任意 **OpenAI 兼容 API**（DeepSeek、通义千问、Moonshot、OpenAI 等）作为 AI 大脑。
+一个运行在本机的 QQ 机器人，人格是又懒又粘人的小鲸娘**鲸娘**（自称"鲸娘"，最爱米饭）。基于 **NoneBot2 + NapCat (OneBot 11)**，支持接入任意 **OpenAI 兼容 API**（DeepSeek、通义千问、Moonshot、OpenAI 等）作为 AI 大脑。
 
 ## 功能一览
 
 | 场景 | 说明 |
 | --- | --- |
-| AI 智能体 | 接入 AI 后自动进入「分院帽」人设：@它 / 私聊它，就会以分院帽的口吻对话、为你分院、答疑 |
+| AI 智能体 | 接入 AI 后自动进入「鲸娘」人设：@它 / 私聊它，就会以鲸娘的口吻对话、答疑 |
 | 关键词对话 | 不接 AI 也能聊：命中 `data/keywords.json` 中的关键词即回复（支持热更新） |
 | 简单问答 | 正则/包含匹配问答，见 `data/qa.json` |
-| 拍一拍 | 被戳一戳会做出魔法风格的回应 |
+| 拍一拍 | 被戳一戳会做出鲸娘风格的回应 |
 | @机器人 | 不接 AI 时 @它 会给出帮助；接 AI 后交给 AI |
-| 进群/退群 | 新成员入群欢迎、退群告别 |
+| 进群 | 新成员入群鲸娘式欢迎（随机 20 条文案） |
 | 复读 | 连续 3 条相同消息复读一次（30 秒冷却） |
 | 定时消息 | 按 cron 定时向指定群发送问候，见 `data/schedule.json` |
 | 今日分院 | `/今日分院` 每天一次，四大院 + 阿兹卡班（AI 判断/随机 5%），附带结果合成图；抽到阿兹卡班需服刑期满再分 |
@@ -23,7 +23,7 @@
 ```
 QQ 账号 ──NapCat(协议端)──> OneBot 11 消息 ──> NoneBot2(机器人框架) ──> 各插件
                                                           │
-                                                          └──> OpenAI 兼容 API（AI 分院帽）
+                                                          └──> OpenAI 兼容 API（AI 鲸娘）
 ```
 
 ## 快速开始
@@ -78,7 +78,7 @@ AI_MODEL=deepseek-chat
 | `data/keywords.json` | 关键词 -> 回复列表（随机取一条） |
 | `data/qa.json` | 问答条目，`regex: true` 表示用正则匹配 |
 | `data/schedule.json` | 定时任务，`cron` 为 5 段 cron 表达式，`groups` 填要发送的群号 |
-| `data/system_prompt.md` | 分院帽 AI 人设提示词（可随意修改） |
+| `data/system_prompt.md` | 鲸娘 AI 人设提示词（可随意修改） |
 
 ## AI 接入示例
 

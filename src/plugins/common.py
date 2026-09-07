@@ -55,7 +55,7 @@ def model_override_path(scope: str) -> Path:
 class AIConfig(BaseModel):
     """AI 聊天服务配置（OpenAI 兼容接口）"""
 
-    ai_enabled: bool = False                              # 是否启用 AI 分院帽
+    ai_enabled: bool = False                              # 是否启用 AI 鲸娘
     openai_api_key: str = ""                              # API Key
     openai_base_url: str = "https://api.deepseek.com/v1"  # API Base URL
     ai_model: str = "deepseek-chat"                       # 对话模型名
@@ -117,7 +117,7 @@ def hide_help(name: str) -> None:
 
 
 async def send_forward_text(
-    bot: Bot, event: MessageEvent, text: str, name: str = "分院帽提示"
+    bot: Bot, event: MessageEvent, text: str, name: str = "鲸娘"
 ) -> None:
     """以合并转发消息（单条文本节点）形式返回提示文本。失败时抛出异常由调用方兜底。"""
     nodes = [

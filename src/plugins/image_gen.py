@@ -348,7 +348,7 @@ async def image_handler(bot: Bot, event: MessageEvent):
                "-local 本机 SD1.5 慢速出图（默认 384x384/15 步，可加 -s 宽x高 改规模、-step 次数 改步数，\n" \
                "  如：-local -s 512x768 -step 30）；-nsfw 跳过内容审查（仅根管理员，须配合 -local）。"
         try:
-            await send_forward_text(bot, event, hint, name="分院帽·生图提示")
+            await send_forward_text(bot, event, hint, name="鲸娘·生图提示")
         except Exception:
             await image_cmd.finish(hint)
         await image_cmd.finish()
