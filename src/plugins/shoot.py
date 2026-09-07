@@ -5,14 +5,15 @@
 
 可选参数（不带参数时全部在合理范围内随机化）：
   射 数量=30 大小=3~15 黏稠=2 起点=右上 不透明度=0.9 颜色=#FFF9C4
-  · 数量 count/n         液滴数量（随机默认 3~100）
-  · 大小 size           半径区间，按 480px 宽度基准，如 3~15 或单值 8（随机默认最小~最大按比例生成）
-  · 黏稠 viscosity/v     0.1~10，越大铺展与下流越慢（随机默认 0.3~3）
+  · 数量 count/n         液滴数量（随机默认 5~140）
+  · 大小 size           半径区间，按 480px 宽度基准，如 3~15 或单值 8（随机默认更大坨）
+  · 黏稠 viscosity/v     0.1~10，越大铺展与下流越慢（随机默认 0.2~2.5，更夸张的拉丝）
   · 起点 origin/o       归一化坐标 x,y（可画外），或 上/下/左/右/左上/右上/左下/右下/中
-  · 不透明度 opacity/a   0~1，越接近 1 越不透明（随机默认 0.75~1，保证可见有色度）
+  · 不透明度 opacity/a   0~1，越接近 1 越不透明（随机默认 0.8~1）
   · 颜色 color/c        #RRGGBB 或 白/淡黄/白黄 等（随机默认纯白~淡黄之间）
 
 说明：随机化会约束在以上合理范围内；手动硬编码的参数直接使用、不受这些范围约束。
+随机起点固定只在四个角落（左上/左下/右上/右下）中选。
 """
 import asyncio
 import io
@@ -48,12 +49,12 @@ _PAINT_FPS = 12         # 每秒帧数
 _PAINT_SECONDS = 3      # 动画时长（秒），末帧停留 1s
 
 # 随机化时的合理范围（仅对"未硬编码的参数"生效）
-_RND_COUNT = (3, 100)           # 数量
-_RND_SIZE_MAX = (10.0, 22.0)    # 最大半径范围（480px 基准）
-_RND_SIZE_MIN_RATIO = (0.25, 0.75)  # 最小半径占最大半径的比例
-_RND_VISCOSITY = (0.3, 3.0)     # 黏稠度
-_RND_OPACITY = (0.75, 1.0)      # 不透明度（从略微透明到不透明）
-_RND_COLOR_BLUE = (200, 255)    # 颜色纯白~淡黄：R=G=255，B 在此范围取值
+_RND_COUNT = (5, 140)            # 数量（更多液滴，更密集）
+_RND_SIZE_MAX = (12.0, 26.0)     # 最大半径范围（480px 基准），更大坨
+_RND_SIZE_MIN_RATIO = (0.3, 0.8)  # 最小半径占最大半径的比例，更粗壮
+_RND_VISCOSITY = (0.2, 2.5)      # 黏稠度（偏稀，铺展更快、拉丝滴落更长更夸张）
+_RND_OPACITY = (0.8, 1.0)        # 不透明度（更实更厚）
+_RND_COLOR_BLUE = (200, 255)     # 颜色纯白~淡黄：R=G=255，B 在此范围取值
 
 
 def _lan() -> object:
@@ -183,11 +184,10 @@ def _resolve_params(parsed: dict, seed: int) -> dict:
         viscosity = round(r.uniform(*_RND_VISCOSITY), 2)
     if "origin" in parsed:
         origin = parsed["origin"]
-    else:  # 从画外一侧随机喷入，避免起点飘在画中央
-        side = r.choice(["top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"])
-        origin = _ORIGIN_PRESET_XY[(side,)]
-        ox, oy = origin
-        origin = (ox + r.uniform(-0.15, 0.15), oy + r.uniform(-0.15, 0.15))
+    else:  # 默认只从四个角落随机喷入（更夸张的横贯式泼洒）
+        corner = r.choice(["top-left", "top-right", "bottom-left", "bottom-right"])
+        ox, oy = _ORIGIN_PRESET_XY[(corner,)]
+        origin = (ox + r.uniform(-0.12, 0.12), oy + r.uniform(-0.12, 0.12))
     if "opacity" in parsed:
         opacity = parsed["opacity"]
     else:
@@ -348,7 +348,7 @@ shoot_matcher = on_message(rule=_shoot_rule, priority=0, block=True)
 _HELP_PARAMS = (
     "引用一张图片回复「射」→ 白色涂料喷溅 GIF。可选参数（不带则随机）：\n"
     "射 数量=30 大小=3~15 黏稠=2 起点=右上 不透明度=0.9 颜色=#FFF9C4\n"
-    "· 数量：3~100（随机）\n· 大小：半径区间，如 3~15\n"
+    "· 数量：5~140（随机）\n· 大小：半径区间，如 3~15\n"
     "· 黏稠：0.1~10\n· 起点：x,y 或 上下左右/方位\n"
     "· 不透明度：0~1\n· 颜色：#RRGGBB 或 白/淡黄"
 )
