@@ -14,6 +14,7 @@
 
 说明：随机化会约束在以上合理范围内；手动硬编码的参数直接使用、不受这些范围约束。
 随机起点固定只在四个角落（左上/左下/右上/右下）中选。
+该功能已在所有群禁用，仅限私聊对话使用。
 """
 import asyncio
 import io
@@ -327,9 +328,9 @@ def _has_image(msg) -> bool:
 
 
 def _shoot_rule(event: MessageEvent) -> bool:
-    """触发规则：引用（回复）了一张图片，且文本为「射」或「射 参数=值 …」。"""
-    if not isinstance(event, MessageEvent):
-        return False
+    """触发规则：仅私聊对话中，引用（回复）了一张图片且文本为「射」或「射 参数=值 …」。"""
+    if isinstance(event, GroupMessageEvent):
+        return False  # 该功能已在所有群禁用，仅对话（私聊）可用
     text = event.get_plaintext().strip()
     if text == "射":
         pass
@@ -463,4 +464,4 @@ async def shoot_handler(bot: Bot, event: MessageEvent):
 
 
 # 启动自检日志：确认本文件最新代码已被加载
-logger.info("shoot 已加载 v3：引用图片回复「射」→ 白色涂料喷溅 GIF（支持参数）")
+logger.info("shoot 已加载 v4：引用图片回复「射」→ 白色涂料喷溅 GIF（仅私聊，群已禁用）")
