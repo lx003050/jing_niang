@@ -1,14 +1,25 @@
-"""引用图片回复「射」→ 返回白色涂料喷溅动画 GIF
+"""引用图片回复「射」→ 返回白色涂料喷溅动画 GIF（支持参数）
 
 用法：引用（回复）一张图片，然后发送单字「射」；
-机器人对该图片生成「白色黏稠涂料喷溅」的循环动画 GIF 后返回。
-效果逻辑移植自 white_paint.py（Pillow + numpy），模拟涂料附着在图片前的透明平面上。
+机器人生成「白色黏稠涂料喷溅」循环 GIF 后返回。效果移植自 white_paint.py（Pillow + numpy）。
+
+可选参数（不带参数时全部在合理范围内随机化）：
+  射 数量=30 大小=3~15 黏稠=2 起点=右上 不透明度=0.9 颜色=#FFF9C4
+  · 数量 count/n         液滴数量（随机默认 3~100）
+  · 大小 size           半径区间，按 480px 宽度基准，如 3~15 或单值 8（随机默认最小~最大按比例生成）
+  · 黏稠 viscosity/v     0.1~10，越大铺展与下流越慢（随机默认 0.3~3）
+  · 起点 origin/o       归一化坐标 x,y（可画外），或 上/下/左/右/左上/右上/左下/右下/中
+  · 不透明度 opacity/a   0~1，越接近 1 越不透明（随机默认 0.75~1，保证可见有色度）
+  · 颜色 color/c        #RRGGBB 或 白/淡黄/白黄 等（随机默认纯白~淡黄之间）
+
+说明：随机化会约束在以上合理范围内；手动硬编码的参数直接使用、不受这些范围约束。
 """
 import asyncio
 import io
 import logging
 import math
 import random
+import re
 import time
 import uuid
 from pathlib import Path
@@ -22,7 +33,7 @@ from nonebot.adapters.onebot.v11 import (
     MessageEvent,
     MessageSegment,
 )
-from PIL import Image, ImageDraw, ImageFilter, ImageOps
+from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageOps
 
 from .common import QA_IMG_DIR
 
@@ -32,9 +43,17 @@ logger = logging.getLogger("sorting_hat.shoot")
 QA_IMG_DIR.mkdir(parents=True, exist_ok=True)
 IMG_DIR_CONTAINER = "/app/napcat/qa_images"
 
-_PAINT_WIDTH = 400      # 最大宽度（调小以控制 GIF 体积，避免发送超时）
+_PAINT_WIDTH = 400      # 最大宽度（控制 GIF 体积与耗时）
 _PAINT_FPS = 12         # 每秒帧数
 _PAINT_SECONDS = 3      # 动画时长（秒），末帧停留 1s
+
+# 随机化时的合理范围（仅对"未硬编码的参数"生效）
+_RND_COUNT = (3, 100)           # 数量
+_RND_SIZE_MAX = (10.0, 22.0)    # 最大半径范围（480px 基准）
+_RND_SIZE_MIN_RATIO = (0.25, 0.75)  # 最小半径占最大半径的比例
+_RND_VISCOSITY = (0.3, 3.0)     # 黏稠度
+_RND_OPACITY = (0.75, 1.0)      # 不透明度（从略微透明到不透明）
+_RND_COLOR_BLUE = (200, 255)    # 颜色纯白~淡黄：R=G=255，B 在此范围取值
 
 
 def _lan() -> object:
@@ -45,28 +64,185 @@ def _lan() -> object:
         return Image.LANCZOS
 
 
-def _paint_gif(content: bytes, seed: int) -> bytes | None:
-    """把图片字节处理为白色涂料喷溅循环 GIF 字节；失败返回 None。
+# ==================== 参数解析 ====================
+_ORIGIN_PRESETS = {
+    "上": ("top",), "下": ("bottom",), "左": ("left",), "右": ("right",),
+    "左上": ("top-left",), "右上": ("top-right",), "左下": ("bottom-left",), "右下": ("bottom-right",),
+    "中": ("center",), "顶": ("top",), "底": ("bottom",),
+}
+_ORIGIN_PRESET_XY = {  # 画外起喷点（与 spray 起点语义一致：液滴自该处射入）
+    ("top",): (0.5, -0.14), ("bottom",): (0.5, 1.14),
+    ("left",): (-0.14, 0.5), ("right",): (1.14, 0.5),
+    ("top-left",): (-0.12, -0.10), ("top-right",): (1.12, -0.10),
+    ("bottom-left",): (-0.12, 1.10), ("bottom-right",): (1.12, 1.10),
+    ("center",): (0.5, 0.5),
+}
+_COLOR_NAMES = {
+    "白": "#FFFFFF", "白色": "#FFFFFF", "white": "#FFFFFF",
+    "淡黄": "#FFF9C4", "白黄": "#FFF9C4", "米黄": "#FFF9C4",
+    "黄": "#FFF176", "黄色": "#FFF176", "yellow": "#FFFF00",
+}
+_PARAM_KEY_ALIAS = {
+    "数量": "count", "count": "count", "n": "count",
+    "大小": "size", "size": "size",
+    "黏稠": "viscosity", "黏稠度": "viscosity", "viscosity": "viscosity", "v": "viscosity",
+    "起点": "origin", "origin": "origin", "o": "origin",
+    "不透明度": "opacity", "透明": "opacity", "opacity": "opacity", "a": "opacity",
+    "颜色": "color", "color": "color", "c": "color",
+}
 
-    逐帧模拟：主喷流飞入 → 撞击后高斯厚度场扩散沉积成黏稠覆盖层 → 顺重力下流，
-    液滴自然融合，配合灰度高度场法线打光与高光。逻辑与 white_paint.py 一致。
+
+def _to_float(val: str, name: str) -> float:
+    try:
+        f = float(val)
+    except ValueError:
+        raise ValueError(f"「{name}」的值「{val}」不是有效数值")
+    if not math.isfinite(f):
+        raise ValueError(f"「{name}」的值「{val}」必须是有限数值")
+    return f
+
+
+def _parse_param_value(key: str, val: str):
+    """把某个参数的字符串值解析成 python 对象；格式错误抛 ValueError。"""
+    if key == "count":
+        try:
+            n = int(val)
+        except ValueError:
+            raise ValueError(f"数量「{val}」不是整数")
+        if n < 0:
+            raise ValueError("数量不能为负")
+        return n
+    if key == "size":
+        if "~" in val:
+            lo, _, hi = val.partition("~")
+            lo, hi = _to_float(lo, "大小"), _to_float(hi, "大小")
+        else:
+            lo = hi = _to_float(val, "大小")
+        if not 0 < lo <= hi:
+            raise ValueError("大小需满足 0 < 最小 <= 最大，如 3~15")
+        return (lo, hi)
+    if key == "viscosity":
+        v = _to_float(val, "黏稠度")
+        if not 0.1 <= v <= 10:
+            raise ValueError("黏稠度需在 0.1~10 之间")
+        return v
+    if key == "opacity":
+        v = _to_float(val, "不透明度")
+        if not 0 <= v <= 1:
+            raise ValueError("不透明度需在 0~1 之间")
+        return v
+    if key == "origin":
+        if val in _ORIGIN_PRESETS:
+            return _ORIGIN_PRESET_XY[_ORIGIN_PRESETS[val]]
+        if "," in val:
+            x, _, y = val.partition(",")
+            x, y = _to_float(x, "起点"), _to_float(y, "起点")
+            return (x, y)
+        raise ValueError("起点需为 x,y 坐标或 上/下/左/右/中 等方位词")
+    if key == "color":
+        if val in _COLOR_NAMES:
+            return _COLOR_NAMES[val]
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", val):
+            return val.upper()
+        raise ValueError("颜色需为 #RRGGBB（如 #FFF9C4）")
+    raise ValueError(f"未知参数：{key}")
+
+
+def _parse_params(body: str) -> dict:
+    """把「射」后面的参数字符串解析成规范 dict（key -> 已解析对象）。"""
+    out: dict = {}
+    tokens = re.findall(r"[^\s,，]+", body.strip())
+    for tok in tokens:
+        if "=" not in tok:
+            raise ValueError(f"参数格式不对：「{tok}」应为 参数名=值")
+        k, _, v = tok.partition("=")
+        kk = _PARAM_KEY_ALIAS.get(k)
+        if kk is None:
+            raise ValueError(f"不认识参数「{k}」，可用：数量 大小 黏稠 起点 不透明度 颜色")
+        if kk in out:
+            raise ValueError(f"参数「{k}」重复了")
+        out[kk] = _parse_param_value(kk, v)
+    return out
+
+
+def _resolve_params(parsed: dict, seed: int) -> dict:
+    """合并硬编码参数与随机默认值；未硬编码的参数在合理范围内随机。"""
+    r = random.Random(seed)
+    if "count" in parsed:
+        count = parsed["count"]
+    else:
+        count = r.randint(*_RND_COUNT)
+    if "size" in parsed:
+        size_min, size_max = parsed["size"]
+    else:
+        size_max = round(r.uniform(*_RND_SIZE_MAX), 2)
+        size_min = round(max(0.5, size_max * r.uniform(*_RND_SIZE_MIN_RATIO)), 2)
+    if "viscosity" in parsed:
+        viscosity = parsed["viscosity"]
+    else:
+        viscosity = round(r.uniform(*_RND_VISCOSITY), 2)
+    if "origin" in parsed:
+        origin = parsed["origin"]
+    else:  # 从画外一侧随机喷入，避免起点飘在画中央
+        side = r.choice(["top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"])
+        origin = _ORIGIN_PRESET_XY[(side,)]
+        ox, oy = origin
+        origin = (ox + r.uniform(-0.15, 0.15), oy + r.uniform(-0.15, 0.15))
+    if "opacity" in parsed:
+        opacity = parsed["opacity"]
+    else:
+        opacity = round(r.uniform(*_RND_OPACITY), 3)
+    if "color" in parsed:
+        color = parsed["color"]
+    else:  # 纯白→淡黄：R=G=255，仅蓝通道变化
+        blue = r.randint(*_RND_COLOR_BLUE)
+        color = "#%02X%02X%02X" % (255, 255, blue)
+    return {
+        "count": count, "size_min": size_min, "size_max": size_max,
+        "viscosity": viscosity, "origin": origin, "opacity": opacity, "color": color,
+    }
+
+
+# ==================== GIF 生成核心 ====================
+def _paint_gif(content: bytes, seed: int, parsed: dict | None = None) -> bytes | None:
+    """把图片字节按参数处理为循环 GIF 字节；失败返回 None。
+
+    parsed 为「射」命令硬编码的参数；未包含的参数会按随机规则补齐。
+    随机布局（起喷时间/落点等）用独立 rng 以 seed 复现。
     """
+    p = _resolve_params({} if parsed is None else parsed, seed)
     im = ImageOps.exif_transpose(Image.open(io.BytesIO(content))).convert("RGB")
     im.thumbnail((_PAINT_WIDTH, round(_PAINT_WIDTH * 1.5)), _lan())
     w, h = im.size
+    rgb = np.array(ImageColor.getrgb(p["color"]), dtype=np.float32)
+    if rgb.shape != (3,):
+        raise ValueError("颜色请使用 #RRGGBB 格式，透明程度用「不透明度」指定")
+    opacity = p["opacity"]
+    viscosity = p["viscosity"]
+
+    def rgba(brightness, alpha, highlight=False):
+        tint = rgb + (255 - rgb) * brightness if highlight else rgb * brightness
+        return (*np.uint8(np.clip(tint, 0, 255)), round(alpha * opacity))
+
     rng = np.random.default_rng(seed)
     base = np.asarray(im, dtype=np.float32)
     yy, xx = np.mgrid[:h, :w].astype(np.float32)
-    scale = w / _PAINT_WIDTH
+    scale = w / 480
     drops = []
-    # 主喷流分成多束，形成不同大小的沉积与细碎卫星液滴
-    for i in range(155):
+    # 主喷流分成多束：较大沉积 + 细碎卫星液滴
+    size_min, size_max = p["size_min"], p["size_max"]
+    split = min(size_max, max(size_min, 5.0))
+    count = p["count"]
+    big_n = round(count * 90 / 155)
+    for i in range(count):
         start = float(rng.uniform(.3, 2.15))
         tx = float(np.clip(rng.normal(.53, .20), .09, .93) * w)
         ty = float(np.clip(rng.normal(.52, .23), .10, .94) * h)
-        radius = float(rng.uniform(5, 19) if i < 90 else rng.uniform(1.5, 5)) * scale
+        radius = float(rng.uniform(split, size_max) if i < big_n
+                       else rng.uniform(size_min, split)) * scale
         drops.append((start, float(rng.uniform(.25, .48)), tx, ty, radius,
                       float(rng.uniform(.65, 1.2)), float(rng.uniform(5, 28)) * scale))
+    ox, oy = p["origin"]
     frames = []
     for frame in range(round(_PAINT_FPS * _PAINT_SECONDS)):
         t = frame / _PAINT_FPS
@@ -78,24 +254,24 @@ def _paint_gif(content: bytes, seed: int) -> bytes | None:
             if age < 0:
                 continue
             if age < flight:
-                p = age / flight
-                sx, sy = -.12 * w, -.08 * h
-                x = sx + (tx - sx) * p
-                y = sy + (ty - sy) * p - .12 * h * math.sin(math.pi * p)
-                vx, vy = tx - sx, ty - sy - .12 * h * math.pi * math.cos(math.pi * p)
-                norm = math.hypot(vx, vy)
-                length = (12 + r * 1.2) * (1 - .45 * p)
+                pn = age / flight
+                sx, sy = ox * w, oy * h
+                x = sx + (tx - sx) * pn
+                y = sy + (ty - sy) * pn - .12 * h * math.sin(math.pi * pn)
+                vx, vy = tx - sx, ty - sy - .12 * h * math.pi * math.cos(math.pi * pn)
+                norm = max(math.hypot(vx, vy), 1e-6)
+                length = (12 + r * 1.2) * (1 - .45 * pn)
                 tail = (x - vx / norm * length, y - vy / norm * length)
-                rr = max(1, r * (.16 + .22 * p))
-                pen.line([tail, (x, y)], fill=(221, 222, 215, 220), width=max(2, int(rr * 2)))
-                pen.ellipse((x - rr, y - rr, x + rr, y + rr), fill=(252, 252, 246, 250))
+                rr = max(1, r * (.16 + .22 * pn))
+                pen.line([tail, (x, y)], fill=rgba(.86, 220), width=max(2, int(rr * 2)))
+                pen.ellipse((x - rr, y - rr, x + rr, y + rr), fill=rgba(.98, 250))
                 pen.line([(tail[0] - 1, tail[1] - 1), (x - 1, y - 1)],
-                         fill=(255, 255, 251, 190), width=max(1, int(rr * .5)))
+                         fill=rgba(.6, 190, True), width=max(1, int(rr * .5)))
                 continue
             elapsed = age - flight
-            spread = .62 + .38 * (1 - math.exp(-elapsed * 15))
+            spread = .62 + .38 * (1 - math.exp(-elapsed * 15 / viscosity))
             rad = r * spread
-            run = drip * max(0, elapsed - .3) ** .68
+            run = drip * max(0, elapsed - .3 * viscosity) ** .68 / viscosity
             # 有限范围高斯厚度场，液滴自然融合成不规则黏稠覆盖层
             xmin, xmax = max(0, int(tx - r * 3)), min(w, int(tx + r * 3 + 1))
             ymin, ymax = max(0, int(ty - r * 3)), min(h, int(ty + run + r * 3 + 1))
@@ -106,15 +282,15 @@ def _paint_gif(content: bytes, seed: int) -> bytes | None:
                 patch += .63 * strength * np.exp(-((X - tx) / (rad * .3)) ** 2 - ((Y - center) / (rad * .45)) ** 2)
                 patch += .5 * strength * np.exp(-((X - tx) / (rad * .42)) ** 2 - ((Y - ty - run) / (rad * .55)) ** 2)
             depth[ymin:ymax, xmin:xmax] += patch
-        alpha = np.clip((depth - .13) * 7, 0, 1)
+        alpha = np.clip((depth - .13) * 7, 0, 1) * opacity
         smooth = np.minimum(depth, 1.8)
         gy, gx = np.gradient(smooth)
         nx, ny = -gx * 10, -gy * 10
         inv = 1 / np.sqrt(nx * nx + ny * ny + 1)
         light = np.clip((-.4 * nx - .55 * ny + .73) * inv, 0, 1)
         shine = np.clip((-.22 * nx - .3 * ny + .928) * inv, 0, 1) ** 35
-        tone = np.clip(190 + 55 * light + 30 * shine, 0, 255)
-        paint = np.stack([tone, tone, tone * .982], axis=-1)
+        diffuse = (190 + 55 * light) / 255
+        paint = np.clip(rgb * diffuse[..., None] + 30 * shine[..., None], 0, 255)
         mask = Image.fromarray(np.uint8(alpha * 255))
         shadow = np.asarray(mask.filter(ImageFilter.GaussianBlur(2.2 * scale)), dtype=np.float32) / 255
         shadow = np.roll(shadow, (max(1, int(3 * scale)), max(1, int(2 * scale))), axis=(0, 1))
@@ -138,6 +314,7 @@ def _paint_gif(content: bytes, seed: int) -> bytes | None:
     return buf.getvalue()
 
 
+# ==================== 触发与图片获取 ====================
 def _has_image(msg) -> bool:
     """判断消息内容里是否含图片段。"""
     if msg is None:
@@ -150,8 +327,15 @@ def _has_image(msg) -> bool:
 
 
 def _shoot_rule(event: MessageEvent) -> bool:
-    """触发规则：引用（回复）了一张图片，且本条消息文本恰好为单字「射」。"""
-    if event.get_plaintext().strip() != "射":
+    """触发规则：引用（回复）了一张图片，且文本为「射」或「射 参数=值 …」。"""
+    if not isinstance(event, MessageEvent):
+        return False
+    text = event.get_plaintext().strip()
+    if text == "射":
+        pass
+    elif text.startswith("射") and "=" in text[1:]:
+        pass
+    else:
         return False
     reply = getattr(event, "reply", None)
     if reply is not None and _has_image(getattr(reply, "message", None)):
@@ -160,6 +344,14 @@ def _shoot_rule(event: MessageEvent) -> bool:
 
 
 shoot_matcher = on_message(rule=_shoot_rule, priority=0, block=True)
+
+_HELP_PARAMS = (
+    "引用一张图片回复「射」→ 白色涂料喷溅 GIF。可选参数（不带则随机）：\n"
+    "射 数量=30 大小=3~15 黏稠=2 起点=右上 不透明度=0.9 颜色=#FFF9C4\n"
+    "· 数量：3~100（随机）\n· 大小：半径区间，如 3~15\n"
+    "· 黏稠：0.1~10\n· 起点：x,y 或 上下左右/方位\n"
+    "· 不透明度：0~1\n· 颜色：#RRGGBB 或 白/淡黄"
+)
 
 
 def _scan_refs(msg) -> list[str]:
@@ -231,9 +423,20 @@ async def shoot_handler(bot: Bot, event: MessageEvent):
     content = await _fetch_image(refs[0])
     if not content:
         await shoot_matcher.finish("这张图我没能读出来，换一张试试？")
+    text = event.get_plaintext().strip()
+    body = text[1:].strip() if text != "射" else ""
+    if body and "=" not in body:
+        await shoot_matcher.finish(_HELP_PARAMS)
+    try:
+        parsed = _parse_params(body) if body else {}
+    except ValueError as exc:
+        await shoot_matcher.finish(f"参数没看懂：{exc}\n" + _HELP_PARAMS)
+    seed = random.randint(0, 2**31 - 1)
     # GIF 逐帧合成是 CPU 密集操作，放到线程池执行，避免卡住消息处理
     try:
-        out = await asyncio.to_thread(_paint_gif, content, random.randint(0, 2**31 - 1))
+        out = await asyncio.to_thread(_paint_gif, content, seed, parsed)
+    except ValueError as exc:
+        await shoot_matcher.finish(f"参数有问题：{exc}")
     except Exception:
         logger.exception("白色涂料喷溅 GIF 生成失败")
         out = None
@@ -260,4 +463,4 @@ async def shoot_handler(bot: Bot, event: MessageEvent):
 
 
 # 启动自检日志：确认本文件最新代码已被加载
-logger.info("shoot 已加载 v2：引用图片回复「射」→ 白色涂料喷溅 GIF")
+logger.info("shoot 已加载 v3：引用图片回复「射」→ 白色涂料喷溅 GIF（支持参数）")
