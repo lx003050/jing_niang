@@ -32,9 +32,9 @@ logger = logging.getLogger("sorting_hat.shoot")
 QA_IMG_DIR.mkdir(parents=True, exist_ok=True)
 IMG_DIR_CONTAINER = "/app/napcat/qa_images"
 
-_PAINT_WIDTH = 480      # 最大宽度（参考 white_paint.py 默认）
-_PAINT_FPS = 20         # 每秒帧数
-_PAINT_SECONDS = 5      # 动画时长（秒），末帧停留 1s
+_PAINT_WIDTH = 400      # 最大宽度（调小以控制 GIF 体积，避免发送超时）
+_PAINT_FPS = 12         # 每秒帧数
+_PAINT_SECONDS = 3      # 动画时长（秒），末帧停留 1s
 
 
 def _lan() -> object:
@@ -244,7 +244,19 @@ async def shoot_handler(bot: Bot, event: MessageEvent):
         (QA_IMG_DIR / fname).write_bytes(out)
     except OSError:
         await shoot_matcher.finish("动图写盘失败了，稍后再试试？")
-    await shoot_matcher.finish(MessageSegment.image(file=f"{IMG_DIR_CONTAINER}/{fname}"))
+    # 体积较大的 GIF 上传偶发超时：失败后稍等重试一次，仍失败再给用户提示
+    seg = MessageSegment.image(file=f"{IMG_DIR_CONTAINER}/{fname}")
+    try:
+        await bot.send(event, seg)
+    except Exception:
+        logger.warning("shoot GIF 首次发送失败，准备重试")
+        await asyncio.sleep(2)
+        try:
+            await bot.send(event, seg)
+        except Exception:
+            logger.warning("shoot GIF 重试仍失败 path=%s", fname, exc_info=True)
+            await shoot_matcher.finish("动图做好了但没发出去（太大或网络抖动），再发一次「射」试试？")
+    await shoot_matcher.finish()
 
 
 # 启动自检日志：确认本文件最新代码已被加载
