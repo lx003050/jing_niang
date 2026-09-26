@@ -22,6 +22,7 @@ from nonebot.params import CommandArg
 from openai import AsyncOpenAI
 
 from .admin_tools import OP_SEED, is_op
+from .sorting_hat import clear_session
 from .common import (
     CAT_PERSONA,
     DATA_DIR,
@@ -350,6 +351,7 @@ def _scope_label(event: MessageEvent) -> str:
 def _set_model_override(scope: str, model: str) -> None:
     MODEL_OVERRIDE_DIR.mkdir(parents=True, exist_ok=True)
     model_override_path(scope).write_text(model.strip(), encoding="utf-8")
+    clear_session(scope)
 
 
 def _clear_model_override(scope: str) -> None:
@@ -357,8 +359,11 @@ def _clear_model_override(scope: str) -> None:
         model_override_path(scope).unlink()
     except FileNotFoundError:
         pass
-    except OSError:
-        pass
+    clear_session(scope)
+
+
+async def _finish_change(message: str, **kwargs) -> None:
+    await persona_cmd.finish(f"{message}\n已清空当前会话历史，并开启新对话。", **kwargs)
 
 
 async def _rename_self(bot: Bot, event: MessageEvent, card: str) -> None:
@@ -463,7 +468,7 @@ async def _imitate_persona(
         await persona_cmd.finish("这轮模仿把原话内容当成了说话风格（过拟合），已拦截，再试一次？")
     await _save_persona(scope, persona)
     await _rename_self(bot, event, f"{name}*bot")
-    await persona_cmd.finish(
+    await _finish_change(
         f"已为 {label} 生成人格 ✅（{mode_desc}，参考 {len(samples)}/{limit} 条发言，不影响其他群）\n"
         f"预览：{persona[:80]}{'…' if len(persona) > 80 else ''}",
         at_sender=True,
@@ -552,11 +557,11 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
         await _save_persona(scope, new_prompt)
         if grok:
             _set_model_override(scope, ai_config.grok_model or "grok-4.6")
-            await persona_cmd.finish(f"已在 {label} 的 system prompt 末尾追加「{add_text}」✅（保留原内容）+ grok 对话模型", at_sender=True)
+            await _finish_change(f"已在 {label} 的 system prompt 末尾追加「{add_text}」✅（保留原内容）+ grok 对话模型", at_sender=True)
         if ds:
             _clear_model_override(scope)
-            await persona_cmd.finish(f"已在 {label} 的 system prompt 末尾追加「{add_text}」✅（保留原内容）+ DeepSeek 对话模型", at_sender=True)
-        await persona_cmd.finish(f"已在 {label} 的 system prompt 末尾追加「{add_text}」✅（保留原内容，不影响其他群）", at_sender=True)
+            await _finish_change(f"已在 {label} 的 system prompt 末尾追加「{add_text}」✅（保留原内容）+ DeepSeek 对话模型", at_sender=True)
+        await _finish_change(f"已在 {label} 的 system prompt 末尾追加「{add_text}」✅（保留原内容，不影响其他群）", at_sender=True)
 
     # -b：恢复默认人格 + 默认模型（仅本群/本私聊）
     if low == "-b":
@@ -566,20 +571,21 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
             pass
         except OSError as e:
             await persona_cmd.finish(f"删除人格文件失败：{e}")
+        clear_session(scope)
         _clear_model_override(scope)
         await _rename_self(bot, event, "")  # 清空群名片，恢复默认昵称
         src = "（管理员自定义版）" if (DATA_DIR / "system_prompt.md").exists() else "（内置默认版）"
-        await persona_cmd.finish(f"已恢复 {label} 的鲸娘人格 🐋{src}，对话模型也回到默认，不影响其他群", at_sender=True)
+        await _finish_change(f"已恢复 {label} 的鲸娘人格 🐋{src}，对话模型也回到默认，不影响其他群", at_sender=True)
 
     # 仅模型参数：保留当前人格，只切 API 与模型
     if not clean:
         if grok:
             model = ai_config.grok_model or "grok-4.6"
             _set_model_override(scope, model)
-            await persona_cmd.finish(f"已为 {label} 设置对话模型为 grok（{model}），人格保持不变，不影响其他群", at_sender=True)
+            await _finish_change(f"已为 {label} 设置对话模型为 grok（{model}），人格保持不变，不影响其他群", at_sender=True)
         if ds:
             _clear_model_override(scope)
-            await persona_cmd.finish(f"已为 {label} 设置对话模型为 DeepSeek（默认），人格保持不变，不影响其他群", at_sender=True)
+            await _finish_change(f"已为 {label} 设置对话模型为 DeepSeek（默认），人格保持不变，不影响其他群", at_sender=True)
 
     # -cat：鲸娘（可叠加 -grok / -deepseek）
     if low == "-cat":
@@ -587,11 +593,11 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
         await _rename_self(bot, event, "鲸娘")
         if grok:
             _set_model_override(scope, ai_config.grok_model or "grok-4.6")
-            await persona_cmd.finish(f"已为 {label} 切换鲸娘人格 🐋 + grok 对话模型，不影响其他群", at_sender=True)
+            await _finish_change(f"已为 {label} 切换鲸娘人格 🐋 + grok 对话模型，不影响其他群", at_sender=True)
         if ds:
             _clear_model_override(scope)
-            await persona_cmd.finish(f"已为 {label} 切换鲸娘人格 🐋 + DeepSeek 对话模型，不影响其他群", at_sender=True)
-        await persona_cmd.finish(f"已为 {label} 切换鲸娘人格 🐋 愿者上钩～", at_sender=True)
+            await _finish_change(f"已为 {label} 切换鲸娘人格 🐋 + DeepSeek 对话模型，不影响其他群", at_sender=True)
+        await _finish_change(f"已为 {label} 切换鲸娘人格 🐋 愿者上钩～", at_sender=True)
 
     # -o：原样直用（可叠加 -grok / -deepseek），支持 "-o 内容" 或 "内容 -o" 两种写法
     if any(w.lower() == "-o" for w in words):
@@ -601,11 +607,11 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
         await _save_persona(scope, req)
         if grok:
             _set_model_override(scope, ai_config.grok_model or "grok-4.6")
-            await persona_cmd.finish(f"已为 {label} 原样设置人格（未优化）+ grok 对话模型 ✅", at_sender=True)
+            await _finish_change(f"已为 {label} 原样设置人格（未优化）+ grok 对话模型 ✅", at_sender=True)
         if ds:
             _clear_model_override(scope)
-            await persona_cmd.finish(f"已为 {label} 原样设置人格（未优化）+ DeepSeek 对话模型 ✅", at_sender=True)
-        await persona_cmd.finish(f"已为 {label} 原样设置人格（未优化）✅", at_sender=True)
+            await _finish_change(f"已为 {label} 原样设置人格（未优化）+ DeepSeek 对话模型 ✅", at_sender=True)
+        await _finish_change(f"已为 {label} 原样设置人格（未优化）✅", at_sender=True)
 
     # 默认：LLM 优化（可叠加 -grok）
     if not clean:
@@ -643,19 +649,19 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
     await _rename_self(bot, event, clean)
     if grok:
         _set_model_override(scope, ai_config.grok_model or "grok-4.6")
-        await persona_cmd.finish(
+        await _finish_change(
             f"已为 {label} 切换人格 ✅（优化后，仅本会话生效）+ 对话模型 grok\n"
             f"预览：{persona[:80]}{'…' if len(persona) > 80 else ''}",
             at_sender=True,
         )
     if ds:
         _clear_model_override(scope)
-        await persona_cmd.finish(
+        await _finish_change(
             f"已为 {label} 切换人格 ✅（优化后，仅本会话生效）+ DeepSeek 对话模型\n"
             f"预览：{persona[:80]}{'…' if len(persona) > 80 else ''}",
             at_sender=True,
         )
-    await persona_cmd.finish(
+    await _finish_change(
         f"已为 {label} 切换人格 ✅（仅本会话生效，不影响其他群）\n"
         f"预览：{persona[:80]}{'…' if len(persona) > 80 else ''}",
         at_sender=True,
@@ -665,6 +671,7 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
 async def _save_persona(scope: str, text: str) -> None:
     PERSONA_DIR.mkdir(parents=True, exist_ok=True)
     persona_path(scope).write_text(text.strip(), encoding="utf-8")
+    clear_session(scope)
     logger.warning("人格已切换 scope=%s 长度=%d", scope, len(text))
 
 

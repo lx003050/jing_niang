@@ -65,17 +65,21 @@ class AIConfig(BaseModel):
     ai_qa_model: str = ""                                 # 答题专用模型名（-q），留空则用 ai_model
     ai_max_history: int = 20                              # 上下文保留的最大消息条数
     ai_cooldown: float = 3.0                              # 同一用户两次请求的最小间隔（秒）
+    sticker_prob: float = 0.125                           # 每次 AI 回复随机附带表情的概率（默认 1/8）
     # /// 生图（/生图）配置 ///
     moyuu_api_key: str = ""                               # 生图平台 moyuu 的 API Key
     moyuu_base_url: str = "https://moyuu.cc/v1"           # 生图平台 Base URL
-    image_model: str = "gpt-image-2"                      # 生图模型
+    image_model: str = "gpt-image-2"                      # -web 参数对应模型（同时是默认通道）
     image_size: str = "1024x1024"                         # 默认出图尺寸
     image_anime_model: str = "nano-banana2-4k"            # -anime 动漫模式专用生图模型
     moyuu_anime_api_key: str = ""                         # -anime 专用 Key（留空则用 moyuu_api_key）
-    # /// moyuu Gemini 生图配置 ///
+    # /// moyuu Gemini 生图配置（该平台 gemini 图像模型只走 /chat/completions）///
     moyuu_gemini_api_key: str = ""                        # -gemini / -gemini3.1 专用 Key（留空则用 moyuu_api_key）
-    image_gemini_model: str = "gemini-3-pro-image-preview"   # -gemini 参数对应模型
+    image_gemini_model: str = "gemini-3.1-flash-image-2K"    # -gemini 参数对应模型
     image_gemini31_model: str = "gemini-3.1-flash-image"     # -gemini3.1 参数对应模型
+    # /// moyuu gpt-image 系列生图配置 ///
+    moyuu_flare_api_key: str = ""                         # -flare 专用 Key（留空则用 moyuu_api_key）
+    image_flare_model: str = "gpt-image-2.5-flare"        # -flare 参数对应模型
     # /// paratera（llmapi.paratera.com）生图配置 ///
     paratera_api_key: str = ""                            # paratera 平台 Key
     paratera_base_url: str = "https://llmapi.paratera.com/v1"
@@ -91,6 +95,10 @@ class AIConfig(BaseModel):
     grok_api_key: str = ""                                # grok 所在平台 Key（moyuu）
     grok_base_url: str = "https://moyuu.cc/v1"
     grok_model: str = "grok-4.6"                          # grok 对话模型名
+    # /// 联网搜索（博查 Bocha）配置：让 AI 遇到不懂/时效性问题时上网搜一搜再作答 ///
+    bocha_api_key: str = ""                               # 博查搜索 API Key（BOCHA_API_KEY，留空则不启用联网搜索）
+    bocha_base_url: str = "https://api.bochaai.com/v1/web-search"  # 博查 Web Search 接口
+    bocha_search_count: int = 5                           # 每次搜索返回的结果条数（1~10）
     # /// 隐私脱敏配置：原硬编码的 QQ 号/群号/服务器地址迁到 .env，代码中不留真实值 ///
     root_seed: int = 0           # 根管理员 QQ（ROOT_SEED）
     restrict_group: int = 0      # 旧白名单管控群（RESTRICT_GROUP，0=未配置则不启用旧群自动建档）
@@ -165,11 +173,18 @@ def hot_load_json(path: Path, cache: dict) -> dict:
 WL_DIR = DATA_DIR / "whitelist"
 WL_CHAT = "chat"  # 特殊白名单项：AI 对话（@机器人 / 回复机器人聊天）
 # 管控群内始终放行的管理指令，避免白名单把权限管理本身锁死
-WL_MANAGE_CMDS = {"白名单", "op", "deop", "suop", "ophelp", "停生图", "打断生图", "取消生图"}
+WL_MANAGE_CMDS = {"白名单", "op", "deop", "suop", "ophelp", "停生图", "打断生图", "取消生图", "导入表情"}
 
 # 纯词触发功能（非 / 命令，以触发词本体进白名单管控）：
-# 键=用户实际发送的触发词，值=展示/规范名。如：引用图片回复「射」触发黏液特效。
-WL_WORD_FEATURES: dict[str, str] = {"射": "射"}
+# 键=用户实际发送的触发词，值=展示/规范名。如：引用图片回复「射」触发黏液特效；
+# 发言恰好只有「jn」或「鲸娘」时回一张随机表情包。
+WL_WORD_FEATURES: dict[str, str] = {
+    "射": "射",
+    "jn": "表情",
+    "鲸娘": "表情",
+    "表情": "表情",
+}
+register_help("/表情", "触发词：发言有且仅有「jn」或「鲸娘」时回一张随机表情包；「jn评价某某」则按某某和群内上下文回一张应景表情")
 
 # 旧硬编码管控群：首次接入白名单时自动沿用原放行命令集，保持既有行为不变。
 # 真实群号在 .env 的 RESTRICT_GROUP 配置；0 = 未配置（默认不启用旧群自动建档）。
@@ -257,6 +272,19 @@ def _group_managed(event) -> bool:
     return wl_managed(gid)
 
 
+def _wl_word_hit(text: str, feats: set[str]) -> bool:
+    """判断发言是否命中已启用的词触发功能（含带参形式）。
+
+    只要已启用的触发词（如「jn」「鲸娘」）是发言开头即算命中，例如「jn评价某某」——
+    这样带参用法无需为每种词形单独加白名单。
+    """
+    low = text.lower()
+    for word, name in WL_WORD_FEATURES.items():
+        if (word in feats or name in feats) and low.startswith(word.lower()):
+            return True
+    return False
+
+
 def _restrict_msg_rule(event: GroupMessageEvent) -> bool:
     """白名单管控群内：未启用功能命令、未开 chat 的 @聊天、以及普通闲聊一律静默拦截。"""
     if not _group_managed(event):
@@ -269,8 +297,8 @@ def _restrict_msg_rule(event: GroupMessageEvent) -> bool:
     feats = wl_features(gid) or set()
     if cmd is not None:
         return cmd not in feats and cmd not in WL_MANAGE_CMDS
-    if text in feats:
-        return False  # 词触发功能（如引用图片回复「射」）已启用则放行
+    if _wl_word_hit(text, feats):
+        return False  # 词触发功能（如引用图片回复「射」，或「jn评价某某」）已启用则放行
     if event.to_me:
         return WL_CHAT not in feats
     return True  # 管控群普通闲聊（非命令、非 @）一律拦截

@@ -23,6 +23,7 @@ probe_*.py
 probe_*.sh
 test_*.py
 smoke_*.py
+_tmp_*.py
 fetch_irena.py
 compress_irena.py
 fix_qa_images.py

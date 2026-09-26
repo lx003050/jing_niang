@@ -39,8 +39,9 @@ DEFAULT_T2I_PROMPT = (
     "，画面高质量、细节丰富、光影自然、色彩准确，"
     "构图专业，商业级高清渲染，必要时附上意境氛围")
 DEFAULT_I2I_PROMPT = (
-    "，参考图中目标主体与构图进行重绘优化，"
-    "提升细节与质感，画面清晰、皮肤与材质真实，高清商业渲染")
+    "，在参考图基础上严格按上面的要求修改：只改动要求改动的地方，"
+    "其余的人物、姿势、构图、画风、配色与整体风格都保持与参考图一致，"
+    "不要自行重绘或美化整张图，改动处自然衔接、细节真实、画面清晰")
 
 # -anime 模式：高质量动漫提示词（配合 nano-banana 模型）
 ANIME_T2I_PROMPT = (
@@ -56,6 +57,9 @@ ANIME_I2I_PROMPT = (
 _IMG_MOUNTS = {
     "/app/napcat/qa_images": str(IMG_DIR),
 }
+
+# gemini 图像模型在本平台只能走 /chat/completions，图片以 `![image](data:image/xxx;base64,...)` 形式塞在正文里
+_CHAT_IMG_RE = re.compile(r"data:image/([A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)")
 
 # 生图失败可重试的错误标志（上游渠道临时不可用，平台错误自带 retry 提示）
 _RETRYABLE_MARKS = ("get_channel_failed", "retry", "timeout", "timed out", "upstream", "502", "503", "504")
@@ -225,6 +229,18 @@ async def _save_ref_image(ref: str) -> Path | None:
         return None
 
 
+def _retryable_api_error(e: Exception) -> bool:
+    """上游报错是否值得重试（渠道临时不可用、限流、超时、5xx 等）。"""
+    code = getattr(e, "status_code", None)
+    msg = str(e).lower()
+    return (
+        (code is not None and code >= 500)
+        or code == 429
+        or "channel" in msg
+        or any(mark in msg for mark in _RETRYABLE_MARKS)
+    )
+
+
 async def _images_call_with_retry(
     client: AsyncOpenAI, *, edit: Path | None, prompt: str, model: str, size: str
 ) -> object:
@@ -237,18 +253,7 @@ async def _images_call_with_retry(
             return await client.images.generate(model=model, prompt=prompt, n=1, size=size)
         except Exception as e:
             last = e
-            code = getattr(e, "status_code", None)
-            msg = str(e).lower()
-            retryable = (
-                (code is not None and code >= 500)
-                or code == 429
-                or "channel" in msg
-                or "retry" in msg
-                or "timeout" in msg
-                or "timed out" in msg
-                or "upstream" in msg
-            )
-            if not retryable or attempt == 4:
+            if not _retryable_api_error(e) or attempt == 4:
                 raise
             logger.warning("生图上游不可用，第 %d/%d 次重试: %s", attempt + 1, 5, str(e)[:150])
             await asyncio.sleep(3 + attempt * 4)
@@ -256,19 +261,89 @@ async def _images_call_with_retry(
     raise last
 
 
+async def _chat_image_call(
+    client: AsyncOpenAI, prompt: str, model: str, ref: Path | None
+) -> tuple[str, str]:
+    """gemini 图像模型生图：该平台不支持 images 接口，改走 /chat/completions。
+
+    图片以 `![image](data:image/xxx;base64,...)` 形式塞在正文里返回；
+    ref 提供本地图片时作为多模态参考图（图生图）。返回 (图片 base64, 扩展名)。
+    """
+    if ref is not None:
+        content: object = [
+            {"type": "text", "text": prompt},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64," + base64.b64encode(ref.read_bytes()).decode("ascii")},
+            },
+        ]
+    else:
+        content = prompt
+    last: Exception | None = None
+    for attempt in range(5):
+        try:
+            resp = await client.chat.completions.create(
+                model=model, messages=[{"role": "user", "content": content}],
+            )
+            text = resp.choices[0].message.content or ""
+            m = _CHAT_IMG_RE.search(text)
+            if not m:
+                raise RuntimeError(f"返回内容里没有图片: {text[:120]}")
+            return m.group(2), m.group(1).lower().replace("jpeg", "jpg")
+        except Exception as e:
+            last = e
+            if not _retryable_api_error(e) or attempt == 4:
+                raise
+            logger.warning("gemini 出图上游不可用，第 %d/%d 次重试: %s", attempt + 1, 5, str(e)[:150])
+            await asyncio.sleep(3 + attempt * 4)
+    assert last is not None
+    raise last
+
+
+def _explain_img_error(e: Exception) -> str:
+    """把生图上游报错归类成一句人话，替换原来只会说「改 prompt」的兜底文案。"""
+    code = getattr(e, "status_code", None)
+    msg = str(e)
+    low = msg.lower()
+    if "insufficient_user_quota" in low or "quota is insufficient" in low:
+        return "账户余额/额度不足，需要充值"
+    if "无权访问" in msg:
+        return "该 Key 无权访问此模型分组"
+    if "可用渠道不存在" in msg or "channel" in low:
+        return "上游没有可用渠道，换机型或稍后再试"
+    if "sensitive" in low or "audit" in low:
+        return "内容审查未通过，换个说法再试"
+    if "返回内容里没有图片" in msg:
+        return "模型没有返回图片（可能拒答了），换个说法再试"
+    if code == 401 or "token_not_found" in low or "invalid api key" in low or "unauthorized" in low:
+        return "API Key 失效或无效"
+    if code == 429 or "rate limit" in low:
+        return "请求太频繁，稍后再试"
+    if "timeout" in low or "timed out" in low:
+        return "上游超时，稍后再试"
+    if "bad_response_status_code" in low or "openai_error" in low:
+        return "上游返回异常，稍后再试"
+    if code is not None and code >= 500:
+        return "上游服务异常，稍后再试"
+    if code == 400:
+        return "上游拒绝了这次请求"
+    return "上游返回异常"
+
+
 async def ai_image_file(prompt: str, ref: Path | None = None) -> Path | None:
-    """供 AI 对话通路等外部调用的云端生图（默认机型）：
+    """供 AI 对话通路等外部调用的云端生图（默认通道 = moyuu gpt-image-2）：
     ref 提供本地图片路径时按图生图（以该图为底图重绘），否则按文生图；
     自动追加与 /生图 一致的默认优化提示词。返回本地文件路径，失败返回 None。
     """
-    if not ai_config.moyuu_api_key:
+    api_key = ai_config.moyuu_api_key
+    if not api_key:
         return None
     prompt = (prompt or "").strip()
     if not prompt:
         return None
     prompt += DEFAULT_I2I_PROMPT if ref is not None else DEFAULT_T2I_PROMPT
     client = AsyncOpenAI(
-        api_key=ai_config.moyuu_api_key, base_url=ai_config.moyuu_base_url, timeout=180.0
+        api_key=api_key, base_url=ai_config.moyuu_base_url, timeout=180.0
     )
     try:
         resp = await _images_call_with_retry(
@@ -314,6 +389,8 @@ async def image_handler(bot: Bot, event: MessageEvent):
     gemini31 = False if (glm or qwen or seed or seedp or anime) else ("-gemini3.1" in low and (" -gemini3.1" in f" {low}" or low.endswith("-gemini3.1") or low.startswith("-gemini3.1")))
     gemini = False if (glm or qwen or seed or seedp or anime or gemini31) else ("-gemini" in low and (" -gemini" in f" {low}" or low.endswith("-gemini") or low.startswith("-gemini")))
     sense = False if (glm or qwen or seed or seedp or anime or gemini31 or gemini) else ("-sense" in low and (" -sense" in f" {low}" or low.endswith("-sense") or low.startswith("-sense")))
+    flare = False if (glm or qwen or seed or seedp or anime or gemini31 or gemini or sense) else ("-flare" in low and (" -flare" in f" {low}" or low.endswith("-flare") or low.startswith("-flare")))
+    web = False if (glm or qwen or seed or seedp or anime or gemini31 or gemini or sense or flare) else ("-web" in low and (" -web" in f" {low}" or low.endswith("-web") or low.startswith("-web")))
     no_opt = "-o" in low and (" -o" in f" {low}" or low.endswith("-o") or low.startswith("-o"))
     is_local = "-local" in low and (" -local" in f" {low}" or low.endswith("-local") or low.startswith("-local"))
     is_nsfw = "-nsfw" in low and (" -nsfw" in f" {low}" or low.endswith("-nsfw") or low.startswith("-nsfw"))
@@ -337,6 +414,8 @@ async def image_handler(bot: Bot, event: MessageEvent):
         .replace("-qwen", "").replace("-seedp", "").replace("-SEEDP", "").replace("-seed", "").replace("-anime", "")
         .replace("-gemini31", "").replace("-gemini3.1", "").replace("-GEMINI31", "").replace("-GEMINI3.1", "")
         .replace("-gemini", "").replace("-GEMINI", "").replace("-sense", "").replace("-SENSE", "")
+        .replace("-flare", "").replace("-FLARE", "")
+        .replace("-web", "").replace("-WEB", "")
         .replace("-local", "").replace("-LOCAL", "").replace("-nsfw", "").replace("-NSFW", "")
         .replace("-o", "", 1)
         .strip()
@@ -349,7 +428,8 @@ async def image_handler(bot: Bot, event: MessageEvent):
         hint = "给我一句描述呀～比如：/生图 一只猫在月光下看星星\n" \
                "引用一张图片再发 /生图 可以按图生图。可选机型参数：\n" \
                "-anime 动漫（nano-banana）；-seed 即梦Seedream4.0；-seedp Seedream5.0；-GLM CogView；" \
-               "-qwen 万相Wan；-gemini GeminiPro预览；-gemini3.1 GeminiFlash；-sense 商汤U1.5海报/信息图；" \
+               "-qwen 万相Wan；-gemini Gemini3.1Flash2K；-gemini3.1 GeminiFlash；-sense 商汤U1.5海报/信息图；" \
+               "-web gpt-image-2（moyuu，默认通道）；-flare gpt-image-2.5-flare（moyuu）；" \
                "-o 不用我加的默认提示词；\n" \
                "-ensure（或 -e）审查报错时自动加安全措辞重试，默认 10 次，可带数字指定次数（如 -e -20 表示尝试 20 次）；\n" \
                "-local 本机 SD1.5 慢速出图（默认 384x384/15 步，可加 -s 宽x高 改规模、-step 次数 改步数，\n" \
@@ -367,8 +447,9 @@ async def image_handler(bot: Bot, event: MessageEvent):
         await _local_generate(bot, event, text, allow_nsfw=is_nsfw, size=local_size, steps=local_steps)
         return
 
-    # 选择机型：默认 / -anime / -seed / -seedp / -GLM / -qwen / -gemini / -gemini3.1（一次只取一个）
+    # 选择机型：默认(=web) / -anime / -seed / -seedp / -GLM / -qwen / -gemini / -gemini3.1 / -flare / -web（一次只取一个）
     img_size = ai_config.image_size
+    chat_mode = False   # gemini 图像模型走 /chat/completions，其余机型走 images 接口
     if glm:
         api_key, base_url, model = ai_config.paratera_api_key, ai_config.paratera_base_url, ai_config.image_glm_model
         anime_style = False
@@ -383,11 +464,14 @@ async def image_handler(bot: Bot, event: MessageEvent):
         api_key, base_url, model = ai_config.paratera_api_key, ai_config.paratera_base_url, ai_config.image_seed_model
         anime_style = False
     elif gemini:
+        # gemini 图像模型在本平台不支持 images 接口，改走 /chat/completions
         api_key, base_url, model = ai_config.moyuu_gemini_api_key or ai_config.moyuu_api_key, ai_config.moyuu_base_url, ai_config.image_gemini_model
         anime_style = False
+        chat_mode = True
     elif gemini31:
         api_key, base_url, model = ai_config.moyuu_gemini_api_key or ai_config.moyuu_api_key, ai_config.moyuu_base_url, ai_config.image_gemini31_model
         anime_style = False
+        chat_mode = True
     elif sense:
         # SenseNova U1.5 系列为文生图模型（仅 text 输入），独立 key/base；不传 size 用平台默认
         api_key, base_url, model = ai_config.sensenova_api_key, ai_config.sensenova_base_url, ai_config.image_sense_model
@@ -396,7 +480,16 @@ async def image_handler(bot: Bot, event: MessageEvent):
     elif anime:
         api_key = ai_config.moyuu_anime_api_key or ai_config.moyuu_api_key
         base_url, model, anime_style = ai_config.moyuu_base_url, ai_config.image_anime_model, True
+    elif flare:
+        # -flare：moyuu gpt-image-2.5-flare
+        api_key = ai_config.moyuu_flare_api_key or ai_config.moyuu_api_key
+        base_url, model, anime_style = ai_config.moyuu_base_url, ai_config.image_flare_model, False
+    elif web:
+        # -web：与默认通道相同（moyuu gpt-image-2），保留作显式指定
+        api_key, base_url, model = ai_config.moyuu_api_key, ai_config.moyuu_base_url, ai_config.image_model
+        anime_style = False
     else:
+        # 默认通道：moyuu gpt-image-2（与 -web 相同）
         api_key, base_url, model = ai_config.moyuu_api_key, ai_config.moyuu_base_url, ai_config.image_model
         anime_style = False
     if not api_key:
@@ -432,17 +525,23 @@ async def image_handler(bot: Bot, event: MessageEvent):
             else:
                 prompt = text + DEFAULT_T2I_PROMPT
 
+        async def _one_call(p: str):
+            """按当前机型选通路：返回 chat 通路的 (base64, 扩展名) 或 images 通路的原始响应。"""
+            if chat_mode:
+                return await _chat_image_call(client, p, model, edit_file)
+            return await _images_call_with_retry(
+                client, edit=edit_file, prompt=p, model=model, size=img_size,
+            )
+
         # -ensure：审查类报错时，不直接报「画布被打翻」，而是逐轮追加安全措辞重试；
         # 原 prompt 主体、参考图等一律不变，仅每轮在末尾追加一句更安全的描述。
         if ensure_total is not None:
-            resp = None
+            out = None
             last_err: Exception | None = None
             for attempt in range(ensure_total):
                 cur_prompt = prompt if attempt == 0 else prompt + _ensure_suffix(attempt)
                 try:
-                    resp = await _images_call_with_retry(
-                        client, edit=edit_file, prompt=cur_prompt, model=model, size=img_size,
-                    )
+                    out = await _one_call(cur_prompt)
                     break
                 except Exception as e2:
                     last_err = e2
@@ -458,17 +557,16 @@ async def image_handler(bot: Bot, event: MessageEvent):
                             bot, event, f"⚠️ 遇到报错，再次尝试……（已尝试 {step}/{ensure_total} 次）"
                         )
                         await asyncio.sleep(1.0)
-            if resp is None:
+            if out is None:
                 assert last_err is not None
                 raise last_err
         else:
-            resp = await _images_call_with_retry(
-                client, edit=edit_file, prompt=prompt, model=model, size=img_size,
-            )
+            out = await _one_call(prompt)
     except Exception as e:
-        logger.warning("生图失败: %s", e)
+        reason = _explain_img_error(e)
+        logger.warning("生图失败(%s): %s", reason, e)
         await _recall_hint(bot, placeholder)
-        await image_cmd.finish("啊，画布被打翻了……请尝试修改 prompt 再试一次～")
+        await image_cmd.finish(f"啊，画布被打翻了……{reason}。")
     finally:
         if edit_file is not None:
             try:
@@ -476,29 +574,111 @@ async def image_handler(bot: Bot, event: MessageEvent):
             except Exception:
                 pass
 
-    items = resp.model_dump().get("data") or []
-    if not items:
-        await _recall_hint(bot, placeholder)
-        await image_cmd.finish("这个模型返回了空结果（平台渠道可能未接通或该模型暂不可用），换个机型试试？")
-    item = items[0]
-    b64 = item.get("b64_json") or ""
-    url = item.get("url") or ""
-    if url.startswith(("http://", "https://")):
-        try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as c:
-                r = await c.get(url)
-                r.raise_for_status()
-                b64 = base64.b64encode(r.content).decode("ascii")
-        except Exception:
-            b64 = ""
-    if not b64:
-        await _recall_hint(bot, placeholder)
-        await image_cmd.finish("出图了但没送到手上（图片下载失败），稍后再试试？")
+    if chat_mode:
+        b64, ext = out
+    else:
+        ext = "png"
+        items = out.model_dump().get("data") or []
+        if not items:
+            await _recall_hint(bot, placeholder)
+            await image_cmd.finish("这个模型返回了空结果（平台渠道可能未接通或该模型暂不可用），换个机型试试？")
+        item = items[0]
+        b64 = item.get("b64_json") or ""
+        url = item.get("url") or ""
+        if url.startswith(("http://", "https://")):
+            try:
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as c:
+                    r = await c.get(url)
+                    r.raise_for_status()
+                    b64 = base64.b64encode(r.content).decode("ascii")
+            except Exception:
+                b64 = ""
+        if not b64:
+            await _recall_hint(bot, placeholder)
+            await image_cmd.finish("出图了但没送到手上（图片下载失败），稍后再试试？")
 
-    fname = f"img_{time.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}.png"
-    (IMG_DIR / fname).write_bytes(base64.b64decode(b64))
+    fname = f"img_{time.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}.{ext}"
+    out_path = IMG_DIR / fname
+    out_path.write_bytes(base64.b64decode(b64))
     await _recall_hint(bot, placeholder)
-    await image_cmd.send(MessageSegment.image(file=f"{IMG_DIR_CONTAINER}/{fname}"))
+    if not await _send_result_image(bot, event, out_path):
+        await image_cmd.finish("图已经画好了，但发送超时没送到群里，再试一次吧～")
+    await _maybe_send_result_sticker(bot, event, text)
+
+
+def _is_send_timeout(e: BaseException) -> bool:
+    """是否为 NapCat 的 sendMsg 超时。
+
+    这类错误（retcode=1200 / Timeout: NTEvent ... NodeIKernelMsgService/sendMsg）
+    只说明 NT 层没在时限内返回，消息往往其实已经发出去了，
+    盲目重发会让同一张图发两遍。
+    """
+    s = str(e)
+    return "NTEvent" in s or "Timeout" in s or "retcode=1200" in s
+
+
+async def _image_already_sent(bot: Bot, event: MessageEvent, since: float) -> bool:
+    """超时后确认图片是否其实已经送到：看群里有没有机器人刚发出去的图。"""
+    if not isinstance(event, GroupMessageEvent):
+        return False
+    try:
+        ret = await asyncio.wait_for(
+            bot.call_api("get_group_msg_history", group_id=event.group_id, message_seq=0, count=5),
+            timeout=10.0,
+        )
+    except Exception:
+        logger.warning("确认生图是否送达失败（查群消息历史）", exc_info=True)
+        return False
+    self_id = int(event.self_id)
+    for m in (ret or {}).get("messages") or []:
+        t = int(m.get("time") or 0)
+        if t and t < since:
+            continue
+        if int((m.get("sender") or {}).get("user_id") or 0) != self_id:
+            continue
+        if any((s or {}).get("type") == "image" for s in (m.get("message") or [])):
+            return True
+    return False
+
+
+async def _send_result_image(bot: Bot, event: MessageEvent, path: Path) -> bool:
+    """发送生成结果图。
+
+    NapCat 偶发 sendMsg 超时（QQ 侧没响应），一次失败就让图片静默丢失，
+    这里先按容器路径退避重试，仍失败则改用 base64 直传绕过路径/挂载问题。
+    但超时往往是「其实已经发出去了」，所以超时后先查群消息确认，
+    确认没送到才重发；查不到就不重发，避免同一张图发两遍。
+    """
+    seg = MessageSegment.image(file=f"{IMG_DIR_CONTAINER}/{path.name}")
+    last_err: BaseException | None = None
+    for attempt in range(3):
+        started = time.time()
+        try:
+            await image_cmd.send(seg)
+            return True
+        except Exception as e:
+            last_err = e
+            logger.warning("生图发送失败(第 %d/3 次): %s", attempt + 1, str(e)[:150])
+            if _is_send_timeout(e):
+                await asyncio.sleep(2.0)
+                if await _image_already_sent(bot, event, started):
+                    logger.info("生图 sendMsg 超时但图片已送达，跳过重发")
+                    return True
+                return False
+            await asyncio.sleep(2 + attempt * 3)
+
+    if last_err is not None and _is_send_timeout(last_err):
+        return False
+
+    try:
+        seg2 = MessageSegment.image(
+            file="base64://" + base64.b64encode(path.read_bytes()).decode("ascii")
+        )
+        await image_cmd.send(seg2)
+        return True
+    except Exception as e:
+        logger.warning("生图 base64 直传失败: %s", str(e)[:150])
+        return False
 
 
 async def _send_hint(bot: Bot, event: MessageEvent, text: str = "🎨 画布铺开，灵感酝酿中……") -> int | None:
@@ -520,6 +700,17 @@ async def _recall_hint(bot: Bot, message_id: int | None) -> None:
         await bot.delete_msg(message_id=message_id)
     except Exception:
         pass
+
+
+async def _maybe_send_result_sticker(bot: Bot, event: MessageEvent, text: str) -> None:
+    """出图后 1/8 概率附带一张与提示词匹配的表情。"""
+    try:
+        from .sticker import maybe_send_sticker
+
+        key = f"group_{event.group_id}" if isinstance(event, GroupMessageEvent) else f"private_{event.user_id}"
+        await maybe_send_sticker(bot, event, text, key)
+    except Exception:
+        logger.warning("生图附带表情失败", exc_info=True)
 
 
 # ---- /生图 -local 本地推理工具 ----
@@ -724,7 +915,8 @@ async def _local_generate(
                 await image_cmd.finish(f"本地图已生成，但未通过内容审查（{reason}），已丢弃。", at_sender=True)
 
         await _recall_hint(bot, placeholder)
-        await image_cmd.finish(MessageSegment.image(file=f"{IMG_DIR_CONTAINER}/{out.name}"))
+        await image_cmd.send(MessageSegment.image(file=f"{IMG_DIR_CONTAINER}/{out.name}"))
+        await _maybe_send_result_sticker(bot, event, text)
 
 
 # ---------- /停生图：打断正在进行的本地生图（仅管理员）----------

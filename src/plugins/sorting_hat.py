@@ -42,6 +42,7 @@ from .common import (
     send_forward_text,
     wl_features,
 )
+from .web_search import WEB_SEARCH_TOOL, run_web_search, web_search_available
 
 logger = logging.getLogger("sorting_hat.ai")
 
@@ -81,6 +82,7 @@ GROUP_CONTEXT_HINT = (
 _client: AsyncOpenAI | None = None
 _vision_client: AsyncOpenAI | None = None
 _memory: dict[str, list[dict]] = {}   # 会话 key -> 消息历史
+_session_tokens: dict[str, object] = {}
 _last_call: dict[int, float] = {}     # user_id -> 上次请求时间
 
 
@@ -139,6 +141,12 @@ def _session_key(event: MessageEvent) -> str:
     if isinstance(event, GroupMessageEvent):
         return f"group_{event.group_id}"
     return f"private_{event.user_id}"
+
+
+def clear_session(scope: str) -> None:
+    key = f"group_{scope[1:]}" if scope.startswith("g") else f"private_{scope[1:]}"
+    _memory.pop(key, None)
+    _session_tokens.pop(key, None)
 
 
 # ---- 对话层防复读：防止 AI 一直重复同一句话（口头禅执行过头 / 模型复读） ----
@@ -659,8 +667,11 @@ async def group_log_handler(bot: Bot, event: GroupMessageEvent):
     if not text:
         return
     key = f"group_{event.group_id}"
-    history = _memory.setdefault(key, [])
+    token = _session_tokens.setdefault(key, object())
     nick = await _get_nick(bot, event.group_id, event.user_id)
+    if _session_tokens.get(key) is not token:
+        return
+    history = _memory.setdefault(key, [])
     history.append({"role": "user", "content": f"[{nick}({event.user_id})] {text}"})
     if len(history) > ai_config.ai_max_history:
         _memory[key] = history[-ai_config.ai_max_history :]
@@ -715,7 +726,31 @@ _AI_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_sticker",
+            "description": (
+                "发送一张表情包来回应。当用户明确想要表情包（如「来个表情」「发表情包」），"
+                "或当前对话情绪很明显、用一个表情回应很自然时调用；不要每句话都调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tag": {
+                        "type": "string",
+                        "description": "想表达的情绪关键词，如 开心 / 疑惑 / 无语 / 鼓励 / 晚安",
+                    }
+                },
+                "required": ["tag"],
+            },
+        },
+    },
 ]
+
+# 联网搜索工具：配置了 BOCHA_API_KEY 才挂载（全局开启，不受群白名单约束）
+if web_search_available():
+    _AI_TOOLS.append(WEB_SEARCH_TOOL)
 
 
 # AI 代发功能支持表：功能主名 -> 可用的白名单命令名（任一命中即视为该功能已开放）
@@ -814,6 +849,8 @@ def _extract_at(event: MessageEvent) -> int | None:
 
 @ai_matcher.handle()
 async def ai_handler(bot: Bot, event: MessageEvent):
+    session_key = _session_key(event)
+    token = _session_tokens.setdefault(session_key, object())
     client = _get_client()
     if client is None:
         await ai_matcher.finish("AI 功能未配置 API Key，请检查 .env 设置。")
@@ -821,7 +858,7 @@ async def ai_handler(bot: Bot, event: MessageEvent):
     user_id = event.user_id
     now = time.time()
     if now - _last_call.get(user_id, 0) < ai_config.ai_cooldown:
-        await ai_matcher.finish("别急嘛，让我先捋捋帽檐……（稍等一下下再问）")
+        await ai_matcher.finish("唔……鲸娘还没缓过来呢，稍等一下下再问嘛～")
     _last_call[user_id] = now
 
     raw_text = event.get_plaintext().strip()
@@ -904,7 +941,9 @@ async def ai_handler(bot: Bot, event: MessageEvent):
         bool(reply_info), len(image_uris), len(image_pairs), use_vision, model, override or "",
     )
 
-    key = _session_key(event)
+    if _session_tokens.get(session_key) is not token:
+        return
+    key = session_key
     history = _memory.setdefault(key, [])
 
     # 被引用消息的说明拼进用户消息，避免 AI 误接群内最新一条
@@ -945,7 +984,11 @@ async def ai_handler(bot: Bot, event: MessageEvent):
         except Exception as e2:
             logger.exception("AI 请求失败: %s", e2)
             await _recall_placeholder(bot, placeholder_id)
-            await ai_matcher.finish("啊，我的魔法好像出了点问题（网络或 API 异常），稍后再试试吧～")
+            await ai_matcher.finish("哎呀，鲸娘好像卡壳了（网络或 API 异常），稍后再试试嘛～")
+
+    if _session_tokens.get(session_key) is not token:
+        await _recall_placeholder(bot, placeholder_id)
+        return
 
     msg = resp.choices[0].message
     reply = (msg.content or "").strip()
@@ -954,14 +997,19 @@ async def ai_handler(bot: Bot, event: MessageEvent):
         extra = getattr(msg, "model_extra", None) or {}
         reply = str(extra.get("reasoning_content") or getattr(msg, "reasoning_content", "") or "").strip()
 
-    # 处理工具调用：AI 自主判刑 / 代发已开放功能（仅对话模式启用过 tools）
+    # 处理工具调用：AI 自主判刑 / 代发已开放功能 / 联网搜索（仅对话模式启用过 tools）
+    sticker_sent = False
+    search_used = False
+    tool_msgs: list[dict] = []  # 联网搜索后追问用：assistant 的每个 tool_call 都必须回填结果
     if msg.tool_calls:
         for tc in msg.tool_calls:
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except Exception:
                 args = {}
-            if tc.function.name == "send_to_azkaban":
+            name = tc.function.name
+            tool_result = "ok"
+            if name == "send_to_azkaban":
                 target = int(args.get("target_qq") or 0)
                 days = int(args.get("days") or 1)
                 reason = str(args.get("reason") or "")
@@ -969,27 +1017,91 @@ async def ai_handler(bot: Bot, event: MessageEvent):
                 from .sorting_system import sentence_user
 
                 ok, info = await sentence_user(target, days, group_id)
+                tool_result = info or "已处理"
                 if not ok:
                     reply = (reply + "\n" if reply else "") + f"（{info}）"
                 elif not reply:
                     reply = info
-            elif tc.function.name == "invoke_feature":
+            elif name == "invoke_feature":
                 feature = _norm_feature(str(args.get("feature") or ""))
                 if feature is None:
-                    continue
-                note = await _ai_invoke_feature(
-                    bot, event, feature, str(args.get("args") or ""),
-                    str(args.get("mode") or ""),
-                )
-                logger.info("AI 代发功能: feature=%s mode=%s note=%s", feature, args.get("mode"), note)
-                reply = (reply + "\n" if reply else "") + note
+                    tool_result = "（未知功能，已忽略）"
+                else:
+                    note = await _ai_invoke_feature(
+                        bot, event, feature, str(args.get("args") or ""),
+                        str(args.get("mode") or ""),
+                    )
+                    logger.info("AI 代发功能: feature=%s mode=%s note=%s", feature, args.get("mode"), note)
+                    reply = (reply + "\n" if reply else "") + note
+                    tool_result = note
+            elif name == "send_sticker":
+                from .sticker import send_sticker_by_tag
 
-    if not reply:
-        reply = "嗯哼……我的魔法书翻了半天也没找到合适的话，再换个问法试试？"
+                ok, info = await send_sticker_by_tag(bot, event, str(args.get("tag") or ""), key)
+                if ok:
+                    sticker_sent = True
+                    tool_result = "表情已发送"
+                else:
+                    reply = (reply + "\n" if reply else "") + f"（{info}）"
+                    tool_result = info
+            elif name == "web_search":
+                query = str(args.get("query") or "").strip()
+                logger.warning("AI 触发联网搜索: %r", query)
+                tool_result = await run_web_search(query)
+                search_used = True
+            tool_msgs.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
+
+    # 联网搜索：把搜索结果回填给模型再追问一次，让它读完资料后作答（首轮回复可能为空或资料未到）
+    if search_used and tool_msgs:
+        follow = messages + [
+            {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments or "{}",
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            }
+        ] + tool_msgs
+        try:
+            resp2 = await client.chat.completions.create(
+                model=model, messages=follow, temperature=0.5 if qa_mode else 0.8
+            )
+            final = (resp2.choices[0].message.content or "").strip()
+            if final:
+                reply = final
+            logger.warning("联网搜索后作答完成: 长度=%d", len(final))
+        except Exception as e:
+            logger.warning("联网搜索后追问失败: %s", e)
+
+    reply_is_fallback = not reply
+    from .sticker import wants_sticker
+
+    ask_sticker = not qa_mode and wants_sticker(raw_text)
+    # 模型没给出文字：用户明确索要表情时后面只发表情即可；否则去掉工具再补问一次，
+    # 避免「自主只调表情工具不写字」或普通对话因空回复而中断
+    if reply_is_fallback and not ask_sticker:
+        retry = await _ask_fallback_text(client, model, messages, qa_mode, session_key, token)
+        if retry:
+            reply = retry
+            reply_is_fallback = False
+            logger.warning("AI 空回复重试补文: %r", reply[:40])
+        else:
+            logger.warning("AI 空回复重试仍无文字，按策略处理")
+            if _session_tokens.get(session_key) is not token:
+                await _recall_placeholder(bot, placeholder_id)
+                return
 
     # 对话层防复读：检出与历史/内部重复时，按原风格自动改写一次；仍复读则放行防死循环。
     # 答题模式 -q 跳过（解题正确性优先，不干预长推导中的必要复述）
-    if not qa_mode:
+    if not qa_mode and reply:
         repeat_reason = _repeat_desc(reply, history)
         if repeat_reason:
             logger.warning("AI 复读拦截: %s", repeat_reason)
@@ -1009,16 +1121,30 @@ async def ai_handler(bot: Bot, event: MessageEvent):
                 logger.warning("AI 复读改写未通过，放行原回复（避免死循环）")
 
     # 记录上下文（群聊存带昵称的原文，私聊存原文；图片以文本标记代替避免体积膨胀）
+    if _session_tokens.get(session_key) is not token:
+        await _recall_placeholder(bot, placeholder_id)
+        return
+    history = _memory.setdefault(key, [])
     history.append({"role": "user", "content": hist_user + (" [图片]" if cur_images else "")})
-    history.append({"role": "assistant", "content": reply})
+    if reply:
+        history.append({"role": "assistant", "content": reply})
     if len(history) > ai_config.ai_max_history:
         _memory[key] = history[-ai_config.ai_max_history :]
     if len(_memory) > 300:  # 全局上限，防止长时间运行内存膨胀
         _memory.clear()
+        _session_tokens.clear()
 
     logger.warning("AI 回复完成: 长度=%d 预览=%r", len(reply), reply[:40])
     # 撤回占位提示，然后正式回复
     await _recall_placeholder(bot, placeholder_id)
+
+    from .sticker import maybe_send_sticker
+
+    # 空回复兜底：明确索要表情 → 只补发一张表情；普通对话已在上方重试过一次 → 静默
+    if reply_is_fallback:
+        if ask_sticker and not sticker_sent:
+            await maybe_send_sticker(bot, event, raw_text, key, force=True)
+        return
 
     # -q 答题模式：一律渲染成图片并以合并转发发送（避免公式无法显示与长文截断）
     if qa_mode:
@@ -1036,6 +1162,37 @@ async def ai_handler(bot: Bot, event: MessageEvent):
         logger.warning("渲染或合并转发失败，回退为文本发送")
     # 断句发送：回复含换行时拆成多条依次发送（每条括号成对），仅 @ 第一条
     await _send_chunked(bot, event, reply)
+    # 随对话附带表情：用户明确索要时必发，否则按概率随机；AI 已发过则不重复
+    if not qa_mode and not sticker_sent:
+        await maybe_send_sticker(bot, event, reply, key, force=ask_sticker)
+
+
+async def _ask_fallback_text(
+    client, model: str, messages: list[dict], qa_mode: bool, session_key: str, token: object
+) -> str:
+    """模型空回复时去掉工具再补问一次，要求直接输出正文；仍为空/异常返回空串。"""
+    tip = (
+        "（你刚才没有输出任何内容）请直接用一句符合当前人设、贴合语境的话回复，"
+        "不要调用任何工具，不要留空，也不要重复问题本身。"
+        if not qa_mode
+        else "（你刚才没有输出内容）请直接给出这道题的完整解答过程与最终答案，不要调用任何工具，不要留空。"
+    )
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=messages + [{"role": "user", "content": tip}],
+            temperature=0.7,
+        )
+    except Exception:
+        logger.warning("AI 空回复补问失败", exc_info=True)
+        return ""
+    # 若等待期间会话已被新一轮消息接管，丢弃本次结果
+    if _session_tokens.get(session_key) is not token:
+        return ""
+    msg = resp.choices[0].message
+    text = str(getattr(msg, "content", None) or "").strip()
+    extra = getattr(msg, "model_extra", None) or {}
+    return text or str(extra.get("reasoning_content") or "").strip()
 
 
 # ---------- /reset 重置对话记忆 ----------
@@ -1045,6 +1202,5 @@ register_help("/reset", "重置对话记忆")
 
 @reset_cmd.handle()
 async def reset_handler(event: MessageEvent):
-    key = _session_key(event)
-    _memory.pop(key, None)
+    clear_session(persona_scope(event))
     await reset_cmd.finish("好的，我已经忘记之前说过的话，重新开始吧～")

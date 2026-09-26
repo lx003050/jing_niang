@@ -551,6 +551,12 @@ async def zhuang_handler(bot: Bot, event: GroupMessageEvent, arg: Message = Comm
     except Exception:
         logger.exception("栽桩合并转发发送失败")
         await zhuang_cmd.finish("合并转发发送失败，稍后再试试～", at_sender=True)
+    # 1/8 概率附带一张与内容匹配的表情
+    from .sticker import maybe_send_sticker
+
+    await maybe_send_sticker(
+        bot, event, arg.extract_plain_text(), f"group_{event.group_id}"
+    )
 
 
 async def _build_zhuang_nodes(bot: Bot, event: GroupMessageEvent, arg: Message) -> list[dict]:

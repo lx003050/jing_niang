@@ -16,6 +16,8 @@
                     —— 之后群内出现完全等于「问内容」的消息时，自动回复「答内容」；
                     -a 表示全部群可触发，-t 或缺省表示仅本群触发；
                     同一个问句有多个答内容时随机回复其中一个；答内容可带图片。
+                    答案里的图片会在录入时立刻转存到本地（data/qa_images），
+                    不依赖会过期的临时链接；若原图取不到会拒绝录入，避免日后失效。
 - /忘记            （仅 OP）：
                     /忘记
                     （问内容）
@@ -24,6 +26,7 @@
 
 以上 OP 指令均不出现在普通 /help 中。
 """
+import asyncio
 import hashlib
 import json
 import logging
@@ -163,6 +166,59 @@ def _qa_pairs() -> list[dict]:
 
 def _save_qa(pairs: list[dict]) -> None:
     _save_json(QA_FILE, {"pairs": pairs})
+
+
+# 会过期的临时图片链接特征（QQ 图片 rkey 链接等），几分钟后就 404，不能当可用地址
+_EPHEMERAL_URL_MARKS = ("multimedia.nt.qq.com.cn", "gchat.qpic.cn", "rkey=")
+
+
+def _img_url_usable(u: str) -> bool:
+    """该网络图地址是否可长期使用（临时 rkey 链接不算）。"""
+    if not u.startswith(("http://", "https://")):
+        return False
+    return not any(m in u for m in _EPHEMERAL_URL_MARKS)
+
+
+def _qa_answer_dead(a) -> bool:
+    """答案是否已失效：图片既没有本地文件、也没有可长期使用的网络地址。
+
+    旧条目在录入时若图片没落盘成功，只会留下一个裸文件名（NapCat 缓存名）
+    或几分钟就过期的 rkey 链接，缓存被清理后就永久发不出来了。
+    """
+    if not isinstance(a, list):
+        return False
+    for d in a:
+        if not isinstance(d, dict) or d.get("type") != "image":
+            continue
+        data = d.get("data") or {}
+        f = str(data.get("file") or "")
+        u = str(data.get("url") or "")
+        if _img_url_usable(f) or _img_url_usable(u):
+            continue  # 有长期可用的网络图兜底
+        if not f:
+            return True
+        if f.startswith(QA_IMG_MOUNT):
+            if not (QA_IMG_DIR / f[len(QA_IMG_MOUNT):].lstrip("/")).exists():
+                return True
+            continue
+        if "/" not in f:
+            return not (QA_IMG_DIR / f).exists()
+        p = _host_path_of_file_ref(f)
+        if p is None or not p.exists():
+            return True
+    return False
+
+
+def prune_dead_qa() -> int:
+    """清除图片已失效的问答条目，返回清除条数。"""
+    pairs = _qa_pairs()
+    if not pairs:
+        return 0
+    alive = [p for p in pairs if not _qa_answer_dead(p.get("a"))]
+    removed = len(pairs) - len(alive)
+    if removed:
+        _save_qa(alive)
+    return removed
 
 
 def find_answers(q: str, group_id: int = 0) -> list:
@@ -371,7 +427,13 @@ async def qa_add_handler(bot: Bot, event: MessageEvent, arg: Message = CommandAr
             at_sender=True,
         )
     # 把答案里的网络图片下载到本地，避免依赖会过期的临时 URL（rkey）
-    a_msg = await _persist_images(a_msg)
+    a_msg, failed_imgs = await _persist_images(a_msg, bot)
+    if failed_imgs:
+        await qa_add_cmd.finish(
+            f"有 {failed_imgs} 张图片没取到原图（消息里的图片链接多半已过期），先不记了。"
+            "请把图片重新发一次，再引用它录入。",
+            at_sender=True,
+        )
     # scope_group: 0 = 全部群，>0 = 仅该群
     scope_group = 0 if scope == "-a" else getattr(event, "group_id", 0)
     pairs = _qa_pairs()
@@ -381,51 +443,112 @@ async def qa_add_handler(bot: Bot, event: MessageEvent, arg: Message = CommandAr
     await qa_add_cmd.finish(f"我记住了（{where}触发）。", at_sender=True)
 
 
-async def _persist_images(msg: Message) -> Message:
-    """把答案消息中的图片持久化到本地数据目录，file 换成容器内可访问路径。
+_IMG_MAGIC = (
+    (b"\xff\xd8\xff", "jpg"),
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+    (b"BM", "bmp"),
+)
 
-    - 优先下载网络 url；url 缺失或下载失败时，回退读取本地 file 引用（file:// 或容器挂载路径）；
-    - 全部失败则保留原 data，至少尝试原样发送。
+
+def _sniff_img_ext(content: bytes) -> str:
+    """按文件头判断真实图片格式，避免把 gif/webp 表情统一存成 .jpg。"""
+    for magic, ext in _IMG_MAGIC:
+        if content.startswith(magic):
+            return ext
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "webp"
+    return "jpg"
+
+
+async def _fetch_image_bytes(bot: Bot | None, data: dict) -> bytes | None:
+    """依次尝试三条路取回图片原始字节，全部失败返回 None。
+
+    1. 网络 url 直接下载；
+    2. url / file 能映射到的本地文件；
+    3. NapCat get_image 兜底——群里的图片链接带 rkey、几分钟就过期，
+       这时让 NapCat 从自己的缓存里把原图重新导出，是唯一能救回来的办法。
+    """
+    url = str(data.get("url") or "")
+    if url.startswith(("http://", "https://")):
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+            return resp.content
+        except Exception:
+            pass
+    for ref in (str(data.get("file") or ""), url):
+        p = _host_path_of_file_ref(ref)
+        if p is None or not p.exists():
+            continue
+        try:
+            return p.read_bytes()
+        except Exception:
+            continue
+    if bot is None:
+        return None
+    for ref in (str(data.get("file") or ""), url):
+        if not ref:
+            continue
+        try:
+            info = await bot.call_api("get_image", file=ref)
+        except Exception:
+            continue
+        for key in ("url", "file"):
+            r2 = str((info or {}).get(key) or "")
+            if not r2:
+                continue
+            if r2.startswith(("http://", "https://")):
+                try:
+                    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                        resp = await client.get(r2)
+                        resp.raise_for_status()
+                    return resp.content
+                except Exception:
+                    continue
+            p = _host_path_of_file_ref(r2)
+            if p is not None and p.exists():
+                try:
+                    return p.read_bytes()
+                except Exception:
+                    continue
+    return None
+
+
+async def _persist_images(msg: Message, bot: Bot | None = None) -> tuple[Message, int]:
+    """把答案消息里的图片落盘到本地，并换成容器可访问路径。
+
+    返回 (处理后的消息, 取图失败的图片数)。失败数 > 0 时调用方应拒绝录入：
+    存进去也是一条注定会失效的问答。
     """
     segs = []
+    failed = 0
     for seg in msg:
         if seg.type == "image":
-            data = dict(seg.data or {})
-            url = str(data.get("url") or "")
-            content: bytes | None = None
-            if url.startswith(("http://", "https://")):
-                try:
-                    async with httpx.AsyncClient(timeout=30) as client:
-                        resp = await client.get(url)
-                        resp.raise_for_status()
-                    content = resp.content
-                except Exception:
-                    content = None
+            content = await _fetch_image_bytes(bot, dict(seg.data or {}))
             if content is None:
-                for ref in (str(data.get("file") or ""), url):
-                    p = _host_path_of_file_ref(ref)
-                    if p is None or not p.exists():
-                        continue
-                    try:
-                        content = p.read_bytes()
-                    except Exception:
-                        content = None
-                    if content is not None:
-                        break
-            if content is not None:
-                try:
-                    QA_IMG_DIR.mkdir(parents=True, exist_ok=True)
-                    seed = url or str(data.get("file") or "img")
-                    filename = hashlib.md5(seed.encode("utf-8")).hexdigest()[:16] + ".jpg"
-                    path = QA_IMG_DIR / filename
-                    if not path.exists():
-                        path.write_bytes(content)
-                    data = {**data, "file": f"{QA_IMG_MOUNT}/{filename}"}
-                except Exception:
-                    logger.warning("图片问答图片保存失败: %s", url[:80])
-            seg.data = data
+                failed += 1
+                logger.warning(
+                    "问答图片取不到原图，拒绝保存: %s",
+                    str((seg.data or {}).get("file") or "")[:80],
+                )
+                segs.append(seg)
+                continue
+            try:
+                QA_IMG_DIR.mkdir(parents=True, exist_ok=True)
+                filename = f"{hashlib.md5(content).hexdigest()[:16]}.{_sniff_img_ext(content)}"
+                path = QA_IMG_DIR / filename
+                if not path.exists():
+                    path.write_bytes(content)
+                # 只留本地路径，丢掉会过期的 rkey url / file_id 等字段
+                seg.data = {"file": f"{QA_IMG_MOUNT}/{filename}"}
+            except Exception:
+                failed += 1
+                logger.warning("问答图片保存失败", exc_info=True)
         segs.append(seg)
-    return Message(segs)
+    return Message(segs), failed
 
 
 def _parse_qa(arg: Message) -> tuple[str, Message | None, str | None]:
@@ -527,13 +650,17 @@ async def qa_monitor_handler(bot: Bot, event: MessageEvent):
     answers = find_answers(text, group_id)
     if not answers:
         return
-    # 逐条尝试发送：图片 URL 过期等发送失败时自动换下一条，避免静默无响应
-    for answer in answers:
-        try:
-            await qa_monitor.send(_answer_message(answer))
-            return
-        except Exception:
-            logger.warning("问答回复发送失败，尝试下一条: q=%s", text)
+    # 同一问句可能录了多条答案：先随机打乱，保证每次随机回其中一条；
+    # 再逐条尝试——NapCat 偶发 sendMsg 超时或某条图片失效时换下一条，避免静默无响应
+    for answer in random.sample(answers, len(answers)):
+        msg = _answer_message(answer)
+        for attempt in range(3):
+            try:
+                await qa_monitor.send(msg)
+                return
+            except Exception:
+                logger.warning("问答回复发送失败(第 %d/3 次): q=%s", attempt + 1, text)
+                await asyncio.sleep(1.5 + attempt * 1.5)
     await qa_monitor.send("这条问答的答案好像失效了，让管理员重新 /问答 录一次吧～")
 
 
@@ -660,7 +787,13 @@ async def wen_qa_handler(bot: Bot, event: MessageEvent):
         for seg in segs
         if isinstance(seg, dict)
     )
-    a_msg = await _persist_images(a_msg)
+    a_msg, failed_imgs = await _persist_images(a_msg, bot)
+    if failed_imgs:
+        await wen_qa_cmd.finish(
+            f"被引用消息里有 {failed_imgs} 张图片取不到原图（链接可能已过期），先不记了。"
+            "请重新发一次图片，再引用它录入。",
+            at_sender=True,
+        )
     scope_group = getattr(event, "group_id", 0)  # 本群；私聊为 0 视为全部群（与 /问答 一致）
     pairs = _qa_pairs()
     pairs.append({"q": query, "a": _msg_to_dicts(a_msg), "group_id": scope_group})
@@ -799,3 +932,14 @@ async def whitelist_handler(bot: Bot, event: MessageEvent, arg: Message = Comman
             else ""
         )
         await wl_cmd.finish(f"已在本群启用：{_wl_plain(name)}{note}")
+
+
+# ---------- 启动自检：清掉图片已失效的问答条目 ----------
+try:
+    _removed = prune_dead_qa()
+    if _removed:
+        logger.warning("启动自检：已清除 %d 条图片失效的问答，请管理员重新录入", _removed)
+    else:
+        logger.info("启动自检：问答库无失效条目")
+except Exception:
+    logger.warning("问答库失效自检失败", exc_info=True)
