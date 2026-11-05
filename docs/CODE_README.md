@@ -139,7 +139,7 @@ sorting_hat/
 
 - 入口 `/生图`（别名 文生图/图生图/生成图片），priority=5。
 
-- 参数解析在 `image_handler`：`-glm/-qwen/-seed/-seedp/-anime/-gemini/-gemini3.1/-sense/-flare/-web` 互斥选云端机型（不写参数时默认走 `-web` 的 `gpt-image-2`）；`-o` 跳过默认提示词；`-local` 走本机推理；`-nsfw` 仅根管理员。
+- 参数解析在 `image_handler`：`-glm/-qwen/-seed/-seedp/-anime/-gemini/-gemini3.1/-sense/-flare/-web` 互斥选云端机型（不写参数时默认走 `-web` 的 `gpt-image-2-web`，连不上会自动按 `image_fallback_models` 轮询兜底）；`-o` 跳过默认提示词；`-local` 走本机推理；`-nsfw` 仅根管理员。
 
 - 云端：`_images_call_with_retry` 自动重试渠道类错误；`-ensure/-e` 审查报错时自动追加安全措辞重试；失败时由 `_explain_img_error` 把上游报错归类（余额不足/无权访问/无可用渠道/审查未过/Key 失效等）回显给用户，完整报错仍写日志。
 

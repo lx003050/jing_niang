@@ -6,6 +6,8 @@
 - /切换人格 -b          -> 删除本群/本私聊人格，恢复默认鲸娘人格
 - /切换人格 小猫 -grok   -> 人格用现有 AI（DeepSeek）优化生成，对话模型切换为 grok
                             （-g / -grok 独立标记；单独 /切换人格 -grok 仅切模型不换人格）
+- /切换人格 小猫 -astra  -> 同上，但对话模型切换为 astra
+                            （-astra 独立标记；单独 /切换人格 -astra 仅切模型不换人格）
 
 人格与对话模型都作用于当前会话范围（本群 / 本私聊），不同群互不影响。
 """
@@ -280,7 +282,7 @@ async def _collect_samples(bot: Bot, group_id: int, uid: int, limit: int = 150) 
 
 # ---------- /切换人格 /查看人格 ----------
 persona_cmd = on_command("切换人格", aliases={"切人格", "换人格", "切换模型"}, priority=1, block=True)
-register_help("/切换人格", "切换 AI 人格（仅管理员，作用于本群/本私聊）：/切换人格 人设；-o 原样直用；-cat 鲸娘；-add 在现有 system prompt 末尾追加词条；-grok 对话模型换 grok；-b 恢复默认")
+register_help("/切换人格", "切换 AI 人格（仅管理员，作用于本群/本私聊）：/切换人格 人设；-o 原样直用；-cat 鲸娘；-add 在现有 system prompt 末尾追加词条；-grok 对话模型换 grok；-astra 对话模型换 astra；-b 恢复默认")
 hide_help("/切换人格")
 
 # ---------- /查看人格 ----------
@@ -305,7 +307,12 @@ async def view_cmd_handler(bot: Bot, event: MessageEvent):
         ov = model_override_path(scope).read_text(encoding="utf-8").strip()
     except Exception:
         pass
-    model_desc = f"grok（{ov}）" if ov else f"DeepSeek（默认 {ai_config.ai_model}）"
+    model_desc = f"DeepSeek（默认 {ai_config.ai_model}）"
+    if ov:
+        if ov == (ai_config.astra_model or "gpt-6-astra"):
+            model_desc = f"astra（{ov}）"
+        else:
+            model_desc = f"grok（{ov}）"
 
     # 实际生效的人格：本群人格文件 > system_prompt.md > 内置默认
     try:
@@ -515,24 +522,25 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
         for w in hint_parts:
             if re.fullmatch(r"-\d+", w):
                 count = int(w[1:])
-            elif w.lower() not in ("-grok", "-g", "-deepseek", "-ds"):
+            elif w.lower() not in ("-grok", "-g", "-astra", "-deepseek", "-ds"):
                 hint_words.append(w)
         count = max(3, min(count, 10000))
         await _imitate_persona(bot, event, scope, label, target_uid, count=count, hint=" ".join(hint_words).strip() or None)
         return
 
-    # 模型参数：-grok/-g 或 -deepseek/-ds（与人格要求可叠加；单独出现时仅切模型、保留人格）
+    # 模型参数：-grok/-g、-astra 或 -deepseek/-ds（与人格要求可叠加；单独出现时仅切模型、保留人格）
     words = pure.split()
     grok = any(w.lower() in ("-grok", "-g") for w in words)
+    astra = any(w.lower() == "-astra" for w in words)
     ds = any(w.lower() in ("-deepseek", "-ds") for w in words)
-    if grok and ds:
-        await persona_cmd.finish("不能同时指定 -grok 和 -deepseek 哦。")
-    clean = " ".join(w for w in words if w.lower() not in ("-grok", "-g", "-deepseek", "-ds")).strip()
+    if sum((grok, astra, ds)) > 1:
+        await persona_cmd.finish("一次只能指定一个模型参数哦（-grok / -astra / -deepseek 三选一）。")
+    clean = " ".join(w for w in words if w.lower() not in ("-grok", "-g", "-astra", "-deepseek", "-ds")).strip()
     low = clean.lower()
 
     # -add：仅追加新词条到当前生效的 system prompt（不重新生成人格、不覆盖原内容）
     if any(w.lower() == "-add" for w in words):
-        add_words = [w for w in words if w.lower() not in ("-add", "-grok", "-g", "-deepseek", "-ds")]
+        add_words = [w for w in words if w.lower() not in ("-add", "-grok", "-g", "-astra", "-deepseek", "-ds")]
         add_text = " ".join(add_words).strip()
         if not add_text:
             await persona_cmd.finish("用法：/切换人格 要追加的话 -add（例如：/切换人格 少说一点奥 -add）", at_sender=True)
@@ -558,6 +566,9 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
         if grok:
             _set_model_override(scope, ai_config.grok_model or "grok-4.6")
             await _finish_change(f"已在 {label} 的 system prompt 末尾追加「{add_text}」✅（保留原内容）+ grok 对话模型", at_sender=True)
+        if astra:
+            _set_model_override(scope, ai_config.astra_model or "gpt-6-astra")
+            await _finish_change(f"已在 {label} 的 system prompt 末尾追加「{add_text}」✅（保留原内容）+ astra 对话模型", at_sender=True)
         if ds:
             _clear_model_override(scope)
             await _finish_change(f"已在 {label} 的 system prompt 末尾追加「{add_text}」✅（保留原内容）+ DeepSeek 对话模型", at_sender=True)
@@ -583,6 +594,10 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
             model = ai_config.grok_model or "grok-4.6"
             _set_model_override(scope, model)
             await _finish_change(f"已为 {label} 设置对话模型为 grok（{model}），人格保持不变，不影响其他群", at_sender=True)
+        if astra:
+            model = ai_config.astra_model or "gpt-6-astra"
+            _set_model_override(scope, model)
+            await _finish_change(f"已为 {label} 设置对话模型为 astra（{model}），人格保持不变，不影响其他群", at_sender=True)
         if ds:
             _clear_model_override(scope)
             await _finish_change(f"已为 {label} 设置对话模型为 DeepSeek（默认），人格保持不变，不影响其他群", at_sender=True)
@@ -594,6 +609,9 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
         if grok:
             _set_model_override(scope, ai_config.grok_model or "grok-4.6")
             await _finish_change(f"已为 {label} 切换鲸娘人格 🐋 + grok 对话模型，不影响其他群", at_sender=True)
+        if astra:
+            _set_model_override(scope, ai_config.astra_model or "gpt-6-astra")
+            await _finish_change(f"已为 {label} 切换鲸娘人格 🐋 + astra 对话模型，不影响其他群", at_sender=True)
         if ds:
             _clear_model_override(scope)
             await _finish_change(f"已为 {label} 切换鲸娘人格 🐋 + DeepSeek 对话模型，不影响其他群", at_sender=True)
@@ -608,18 +626,21 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
         if grok:
             _set_model_override(scope, ai_config.grok_model or "grok-4.6")
             await _finish_change(f"已为 {label} 原样设置人格（未优化）+ grok 对话模型 ✅", at_sender=True)
+        if astra:
+            _set_model_override(scope, ai_config.astra_model or "gpt-6-astra")
+            await _finish_change(f"已为 {label} 原样设置人格（未优化）+ astra 对话模型 ✅", at_sender=True)
         if ds:
             _clear_model_override(scope)
             await _finish_change(f"已为 {label} 原样设置人格（未优化）+ DeepSeek 对话模型 ✅", at_sender=True)
         await _finish_change(f"已为 {label} 原样设置人格（未优化）✅", at_sender=True)
 
-    # 默认：LLM 优化（可叠加 -grok）
+    # 默认：LLM 优化（可叠加 -grok / -astra）
     if not clean:
         await persona_cmd.finish(
             "用法（作用于本群/本私聊，不影响其他群）：\n/切换人格 人设（如：/切换人格 猫娘）\n"
             "-o 后直接写提示词不优化（也可写在末尾，如：/切换人格 一只猫娘 -o）\n-cat 切换鲸娘\n"
             "-add 在现有 system prompt 末尾追加词条（如：/切换人格 少说一点奥 -add）\n"
-            "-grok/-g 对话模型换 grok\n-deepseek/-ds 对话模型换回 DeepSeek\n"
+            "-grok/-g 对话模型换 grok\n-astra 对话模型换 astra\n-deepseek/-ds 对话模型换回 DeepSeek\n"
             "只给模型参数不给人设时，保留现有人格仅切模型\n"
             "-b 恢复默认鲸娘人格与模型",
             at_sender=True,
@@ -651,6 +672,13 @@ async def persona_handler(bot: Bot, event: MessageEvent, arg: Message = CommandA
         _set_model_override(scope, ai_config.grok_model or "grok-4.6")
         await _finish_change(
             f"已为 {label} 切换人格 ✅（优化后，仅本会话生效）+ 对话模型 grok\n"
+            f"预览：{persona[:80]}{'…' if len(persona) > 80 else ''}",
+            at_sender=True,
+        )
+    if astra:
+        _set_model_override(scope, ai_config.astra_model or "gpt-6-astra")
+        await _finish_change(
+            f"已为 {label} 切换人格 ✅（优化后，仅本会话生效）+ 对话模型 astra\n"
             f"预览：{persona[:80]}{'…' if len(persona) > 80 else ''}",
             at_sender=True,
         )

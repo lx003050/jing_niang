@@ -69,7 +69,11 @@ class AIConfig(BaseModel):
     # /// 生图（/生图）配置 ///
     moyuu_api_key: str = ""                               # 生图平台 moyuu 的 API Key
     moyuu_base_url: str = "https://moyuu.cc/v1"           # 生图平台 Base URL
-    image_model: str = "gpt-image-2"                      # -web 参数对应模型（同时是默认通道）
+    image_model: str = "gpt-image-2-web"                  # 默认通道（同时是 -web 参数）对应模型
+    image_fallback_models: str = (                        # 默认通道连不上时依次轮询的兜底模型（英文逗号分隔）
+        "gpt-image-2,gpt-image-2-ad-medium,gpt-image-2-ad-medium2,"
+        "gpt-image-2.5-flare,gpt-image-2.5-sunburst"
+    )
     image_size: str = "1024x1024"                         # 默认出图尺寸
     image_anime_model: str = "nano-banana2-4k"            # -anime 动漫模式专用生图模型
     moyuu_anime_api_key: str = ""                         # -anime 专用 Key（留空则用 moyuu_api_key）
@@ -95,6 +99,10 @@ class AIConfig(BaseModel):
     grok_api_key: str = ""                                # grok 所在平台 Key（moyuu）
     grok_base_url: str = "https://moyuu.cc/v1"
     grok_model: str = "grok-4.6"                          # grok 对话模型名
+    # /// astra 对话模型（/切换人格 -astra 用）///
+    astra_api_key: str = ""                               # astra 所在平台 Key（moyuu）
+    astra_base_url: str = "https://moyuu.cc/v1"
+    astra_model: str = "gpt-6-astra"                      # astra 对话模型名（moyuu 上的 id）
     # /// 联网搜索（博查 Bocha）配置：让 AI 遇到不懂/时效性问题时上网搜一搜再作答 ///
     bocha_api_key: str = ""                               # 博查搜索 API Key（BOCHA_API_KEY，留空则不启用联网搜索）
     bocha_base_url: str = "https://api.bochaai.com/v1/web-search"  # 博查 Web Search 接口
@@ -183,6 +191,8 @@ WL_WORD_FEATURES: dict[str, str] = {
     "jn": "表情",
     "鲸娘": "表情",
     "表情": "表情",
+    "表图": "幻影坦克",
+    "里图": "幻影坦克",
 }
 register_help("/表情", "触发词：发言有且仅有「jn」或「鲸娘」时回一张随机表情包；「jn评价某某」则按某某和群内上下文回一张应景表情")
 

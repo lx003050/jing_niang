@@ -261,6 +261,49 @@ async def _images_call_with_retry(
     raise last
 
 
+# 默认渠道轮询兜底：每个模型的尝试次数、切到下一个模型前的等待
+_IMG_FAILOVER_ATTEMPTS = 2
+_IMG_FAILOVER_SLEEP = 2.0
+
+
+def _default_image_models() -> list[str]:
+    """默认渠道的模型链路：默认模型打头，其后依次是配置里的兜底模型（去重、保序）。"""
+    raw = [ai_config.image_model, *(ai_config.image_fallback_models or "").split(",")]
+    chain: list[str] = []
+    for m in raw:
+        m = m.strip()
+        if m and m not in chain:
+            chain.append(m)
+    return chain
+
+
+async def _images_call_failover(
+    client: AsyncOpenAI, *, edit: Path | None, prompt: str, models: list[str], size: str
+) -> object:
+    """默认渠道生图：按模型链路依次尝试，某模型上游无法连接时自动轮询到下一个。
+
+    仅「无法连接」类错误（渠道缺失、超时、5xx、限流等可重试错误）才切换模型；
+    审查类等不可重试错误直接抛出，避免把内容问题误判成渠道问题。
+    """
+    last: Exception | None = None
+    for idx, model in enumerate(models):
+        for attempt in range(_IMG_FAILOVER_ATTEMPTS):
+            try:
+                if edit is not None:
+                    return await client.images.edit(model=model, image=edit, prompt=prompt, n=1, size=size)
+                return await client.images.generate(model=model, prompt=prompt, n=1, size=size)
+            except Exception as e:
+                last = e
+                if not _retryable_api_error(e):
+                    raise
+                if attempt + 1 < _IMG_FAILOVER_ATTEMPTS:
+                    await asyncio.sleep(_IMG_FAILOVER_SLEEP)
+        if idx + 1 < len(models):
+            logger.warning("默认渠道模型 %s 无法连接，轮询切换到 %s", model, models[idx + 1])
+    assert last is not None
+    raise last
+
+
 async def _chat_image_call(
     client: AsyncOpenAI, prompt: str, model: str, ref: Path | None
 ) -> tuple[str, str]:
@@ -331,7 +374,8 @@ def _explain_img_error(e: Exception) -> str:
 
 
 async def ai_image_file(prompt: str, ref: Path | None = None) -> Path | None:
-    """供 AI 对话通路等外部调用的云端生图（默认通道 = moyuu gpt-image-2）：
+    """供 AI 对话通路等外部调用的云端生图（默认通道 = moyuu gpt-image-2-web，
+    连不上时按配置依次轮询兜底模型）：
     ref 提供本地图片路径时按图生图（以该图为底图重绘），否则按文生图；
     自动追加与 /生图 一致的默认优化提示词。返回本地文件路径，失败返回 None。
     """
@@ -346,8 +390,8 @@ async def ai_image_file(prompt: str, ref: Path | None = None) -> Path | None:
         api_key=api_key, base_url=ai_config.moyuu_base_url, timeout=180.0
     )
     try:
-        resp = await _images_call_with_retry(
-            client, edit=ref, prompt=prompt, model=ai_config.image_model, size=ai_config.image_size
+        resp = await _images_call_failover(
+            client, edit=ref, prompt=prompt, models=_default_image_models(), size=ai_config.image_size
         )
     except Exception as e:
         logger.warning("AI 通路生图失败: %s", str(e)[:150])
@@ -429,7 +473,7 @@ async def image_handler(bot: Bot, event: MessageEvent):
                "引用一张图片再发 /生图 可以按图生图。可选机型参数：\n" \
                "-anime 动漫（nano-banana）；-seed 即梦Seedream4.0；-seedp Seedream5.0；-GLM CogView；" \
                "-qwen 万相Wan；-gemini Gemini3.1Flash2K；-gemini3.1 GeminiFlash；-sense 商汤U1.5海报/信息图；" \
-               "-web gpt-image-2（moyuu，默认通道）；-flare gpt-image-2.5-flare（moyuu）；" \
+               "-web gpt-image-2-web（moyuu，默认通道，连不上会自动轮询兜底模型）；-flare gpt-image-2.5-flare（moyuu）；" \
                "-o 不用我加的默认提示词；\n" \
                "-ensure（或 -e）审查报错时自动加安全措辞重试，默认 10 次，可带数字指定次数（如 -e -20 表示尝试 20 次）；\n" \
                "-local 本机 SD1.5 慢速出图（默认 384x384/15 步，可加 -s 宽x高 改规模、-step 次数 改步数，\n" \
@@ -450,6 +494,7 @@ async def image_handler(bot: Bot, event: MessageEvent):
     # 选择机型：默认(=web) / -anime / -seed / -seedp / -GLM / -qwen / -gemini / -gemini3.1 / -flare / -web（一次只取一个）
     img_size = ai_config.image_size
     chat_mode = False   # gemini 图像模型走 /chat/completions，其余机型走 images 接口
+    model_chain: list[str] | None = None   # 非空表示默认渠道：按该模型链路轮询兜底
     if glm:
         api_key, base_url, model = ai_config.paratera_api_key, ai_config.paratera_base_url, ai_config.image_glm_model
         anime_style = False
@@ -485,13 +530,15 @@ async def image_handler(bot: Bot, event: MessageEvent):
         api_key = ai_config.moyuu_flare_api_key or ai_config.moyuu_api_key
         base_url, model, anime_style = ai_config.moyuu_base_url, ai_config.image_flare_model, False
     elif web:
-        # -web：与默认通道相同（moyuu gpt-image-2），保留作显式指定
+        # -web：与默认通道相同（moyuu gpt-image-2-web），连不上时按链路轮询兜底
         api_key, base_url, model = ai_config.moyuu_api_key, ai_config.moyuu_base_url, ai_config.image_model
         anime_style = False
+        model_chain = _default_image_models()
     else:
-        # 默认通道：moyuu gpt-image-2（与 -web 相同）
+        # 默认通道：moyuu gpt-image-2-web（与 -web 相同），连不上时按链路轮询兜底
         api_key, base_url, model = ai_config.moyuu_api_key, ai_config.moyuu_base_url, ai_config.image_model
         anime_style = False
+        model_chain = _default_image_models()
     if not api_key:
         await image_cmd.finish("生图功能未配置 API Key，请管理员在 .env 中填写相应 Key。")
 
@@ -529,6 +576,10 @@ async def image_handler(bot: Bot, event: MessageEvent):
             """按当前机型选通路：返回 chat 通路的 (base64, 扩展名) 或 images 通路的原始响应。"""
             if chat_mode:
                 return await _chat_image_call(client, p, model, edit_file)
+            if model_chain is not None:
+                return await _images_call_failover(
+                    client, edit=edit_file, prompt=p, models=model_chain, size=img_size,
+                )
             return await _images_call_with_retry(
                 client, edit=edit_file, prompt=p, model=model, size=img_size,
             )
@@ -585,13 +636,14 @@ async def image_handler(bot: Bot, event: MessageEvent):
         item = items[0]
         b64 = item.get("b64_json") or ""
         url = item.get("url") or ""
-        if url.startswith(("http://", "https://")):
+        if not b64 and url.startswith(("http://", "https://")):
             try:
                 async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as c:
                     r = await c.get(url)
                     r.raise_for_status()
                     b64 = base64.b64encode(r.content).decode("ascii")
-            except Exception:
+            except Exception as e:
+                logger.warning("生图结果 URL 下载失败: %s | url=%s", str(e)[:120], url[:120])
                 b64 = ""
         if not b64:
             await _recall_hint(bot, placeholder)

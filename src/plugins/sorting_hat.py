@@ -912,7 +912,7 @@ async def ai_handler(bot: Bot, event: MessageEvent):
         if len(image_uris) >= 2:
             break
 
-    # 模型选择：带图 -> 视觉模型；纯文本 -q -> 答题模型；群级 grok 覆盖 -> grok；否则用对话模型
+    # 模型选择：带图 -> 视觉模型；纯文本 -q -> 答题模型；群级 grok/astra 覆盖 -> 对应渠道；否则用对话模型
     use_vision = bool(image_uris)
     override = None
     if not use_vision and not qa_mode:
@@ -933,9 +933,14 @@ async def ai_handler(bot: Bot, event: MessageEvent):
     else:
         model = ai_config.ai_model
     if override:
-        if not ai_config.grok_api_key:
-            await ai_matcher.finish("grok 对话模型未配置 Key，请管理员在 .env 配置 GROK_API_KEY。")
-        client = AsyncOpenAI(api_key=ai_config.grok_api_key, base_url=ai_config.grok_base_url or None, timeout=60.0)
+        if override == (ai_config.astra_model or "gpt-6-astra"):
+            if not ai_config.astra_api_key:
+                await ai_matcher.finish("astra 对话模型未配置 Key，请管理员在 .env 配置 ASTRA_API_KEY。")
+            client = AsyncOpenAI(api_key=ai_config.astra_api_key, base_url=ai_config.astra_base_url or None, timeout=60.0)
+        else:
+            if not ai_config.grok_api_key:
+                await ai_matcher.finish("grok 对话模型未配置 Key，请管理员在 .env 配置 GROK_API_KEY。")
+            client = AsyncOpenAI(api_key=ai_config.grok_api_key, base_url=ai_config.grok_base_url or None, timeout=60.0)
     logger.warning(
         "AI 参数: 引用=%s 图=%d/%d 视觉模型=%s 模型=%s 覆盖=%s",
         bool(reply_info), len(image_uris), len(image_pairs), use_vision, model, override or "",

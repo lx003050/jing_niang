@@ -33,5 +33,9 @@ deploy_sense.sh
 qrcode.png
 bp_*.html
 
+# 幻影坦克调试产物与样本
+_mirage_tmp/
+_samples/
+
 # 日志
 *.log
